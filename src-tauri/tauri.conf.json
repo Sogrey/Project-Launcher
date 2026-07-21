@@ -1,0 +1,39 @@
+{
+  "$schema": "https://v2.tauri.app/config/schema.json",
+  "productName": "Project Launcher",
+  "version": "1.0.0",
+  "identifier": "com.project-launcher.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "Project Launcher",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: asset: http://asset.localhost",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost"
+      }
+    }
+  },
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "icon": ["icons/icon.png"]
+  }
+}

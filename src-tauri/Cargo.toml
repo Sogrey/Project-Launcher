@@ -1,0 +1,28 @@
+[package]
+name = "project-launcher"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "project-launcher"
+path = "src/main.rs"
+
+[profile.release]
+codegen-units = 1
+lto = true
+
+[target.'cfg(windows)'.profile.release]
+rustflags = ["-C", "link-args=/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.0", features = ["tray-icon"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri-plugin-store = "2.4.0"
+tauri-plugin-dialog = "2.7.0"
+tauri-plugin-shell = "2.0.0"
+lazy_static = "1.4"
+regex = "1.10"
