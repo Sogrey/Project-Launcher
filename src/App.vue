@@ -18,21 +18,15 @@ onMounted(async () => {
 
   unlistens.push(
     await listen<[string, string]>('project:port', (event) => {
-      const [projectId, port] = event.payload
-      const projectPath = store.pathFromProjectId(projectId)
-      if (projectPath) {
-        store.addPort(projectPath, port)
-      }
+      const [runId, port] = event.payload
+      store.addPort(runId, port)
     })
   )
 
   unlistens.push(
     await listen<[string, string]>('project:log', (event) => {
-      const [projectId, chunk] = event.payload
-      const projectPath = store.pathFromProjectId(projectId)
-      if (projectPath) {
-        store.addLog(projectPath, chunk)
-      }
+      const [runId, chunk] = event.payload
+      store.addLog(runId, chunk)
     })
   )
 

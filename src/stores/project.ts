@@ -9,13 +9,31 @@ export interface Project {
   scripts: [string, string][]
 }
 
+export interface Workspace {
+  id: string
+  name: string
+  projects: Project[]
+}
+
+export interface AppConfig {
+  activeWorkspaceId: string
+  workspaces: Workspace[]
+}
+
 export type PackageManager = 'npm' | 'pnpm' | 'yarn'
 
-export interface RunningProject {
+/** One running script instance (a project may have several). */
+export interface RunningRun {
+  runId: string
   project: Project
   script: string
   packageManager: PackageManager
-  isRunning: boolean
+}
+
+export interface ErroredRun {
+  runId: string
+  project: Project
+  script: string
 }
 
 const MAX_LOG_LINES = 2000
@@ -25,33 +43,52 @@ function errorMessage(err: unknown): string {
   return String(err)
 }
 
+function defaultConfig(): AppConfig {
+  return {
+    activeWorkspaceId: 'ws_default',
+    workspaces: [{ id: 'ws_default', name: '默认', projects: [] }],
+  }
+}
+
 export const useProjectStore = defineStore('project', () => {
+  const workspaces = ref<Workspace[]>([])
+  const activeWorkspaceId = ref<string>('ws_default')
   const projects = ref<Project[]>([])
-  const runningProjects = ref<Map<string, RunningProject>>(new Map())
-  const projectLogs = ref<Map<string, string[]>>(new Map())
-  const projectPorts = ref<Map<string, string[]>>(new Map())
-  const erroredProjectPaths = ref<Set<string>>(new Set())
+  /** Key = runId (`pathId@script`), matches Rust backend. */
+  const runningRuns = ref<Map<string, RunningRun>>(new Map())
+  /** Logs / ports keyed by runId so scripts do not share output or ports. */
+  const runLogs = ref<Map<string, string[]>>(new Map())
+  const runPorts = ref<Map<string, string[]>>(new Map())
+  const erroredRuns = ref<Map<string, ErroredRun>>(new Map())
   const selectedProjectPath = ref<string | null>(null)
+  /** When set, detail drawer is for a single running script. */
+  const selectedRunId = ref<string | null>(null)
   const packageManager = ref<PackageManager>('npm')
-  const workspacePath = ref<string | null>(null)
   const todayStartCount = ref(0)
   const initialized = ref(false)
 
-  const totalProjects = computed(() => projects.value.length)
-  const runningCount = computed(() => runningProjects.value.size)
-  const erroredCount = computed(() => erroredProjectPaths.value.size)
-
-  const runningProjectList = computed(() =>
-    projects.value.filter((p) => runningProjects.value.has(p.path))
+  const activeWorkspace = computed(
+    () => workspaces.value.find((w) => w.id === activeWorkspaceId.value) || null
   )
-  const stoppedProjects = computed(() =>
-    projects.value.filter(
-      (p) => !runningProjects.value.has(p.path) && !erroredProjectPaths.value.has(p.path)
+  const activeWorkspaceName = computed(() => activeWorkspace.value?.name || '未命名')
+
+  const totalProjects = computed(() => projects.value.length)
+
+  const runningRunList = computed(() =>
+    [...runningRuns.value.values()].filter((run) =>
+      projects.value.some((p) => p.path === run.project.path)
     )
   )
-  const erroredProjects = computed(() =>
-    projects.value.filter((p) => erroredProjectPaths.value.has(p.path))
+
+  const runningCount = computed(() => runningRunList.value.length)
+
+  const erroredRunList = computed(() =>
+    [...erroredRuns.value.values()].filter((run) =>
+      projects.value.some((p) => p.path === run.project.path)
+    )
   )
+
+  const erroredCount = computed(() => erroredRunList.value.length)
 
   const selectedProject = computed(() =>
     selectedProjectPath.value
@@ -59,34 +96,101 @@ export const useProjectStore = defineStore('project', () => {
       : null
   )
 
+  /** `project` = script list drawer; `run` = single-script log drawer. */
+  const detailMode = computed<'project' | 'run'>(() =>
+    selectedRunId.value ? 'run' : 'project'
+  )
+
+  const selectedRun = computed(() =>
+    selectedRunId.value ? runningRuns.value.get(selectedRunId.value) || null : null
+  )
+
   function pathToProjectId(path: string): string {
-    // Align with Rust char::is_alphanumeric() (Unicode letters + numbers).
     return path.replace(/[^\p{L}\p{N}]/gu, '_')
   }
 
-  function pathFromProjectId(projectId: string): string | undefined {
-    return projects.value.find((p) => pathToProjectId(p.path) === projectId)?.path
+  function runIdFor(path: string, script: string): string {
+    return `${pathToProjectId(path)}@${script}`
   }
 
-  async function persistProjects() {
+  function resolveRunId(runId: string): { path: string; script: string } | undefined {
+    const at = runId.lastIndexOf('@')
+    if (at <= 0) return undefined
+    const pathId = runId.slice(0, at)
+    const script = runId.slice(at + 1)
+    const path = projects.value.find((p) => pathToProjectId(p.path) === pathId)?.path
+    if (!path) return undefined
+    return { path, script }
+  }
+
+  function pathFromRunId(runId: string): string | undefined {
+    return resolveRunId(runId)?.path
+  }
+
+  function isScriptRunning(path: string, script: string): boolean {
+    return runningRuns.value.has(runIdFor(path, script))
+  }
+
+  function runningScriptsFor(path: string): string[] {
+    return [...runningRuns.value.values()]
+      .filter((r) => r.project.path === path)
+      .map((r) => r.script)
+  }
+
+  function hasRunningScripts(path: string): boolean {
+    return runningScriptsFor(path).length > 0
+  }
+
+  function syncActiveProjectsFromWorkspaces() {
+    const ws = workspaces.value.find((w) => w.id === activeWorkspaceId.value)
+    projects.value = ws ? [...ws.projects] : []
+  }
+
+  function writeProjectsToActiveWorkspace() {
+    const idx = workspaces.value.findIndex((w) => w.id === activeWorkspaceId.value)
+    if (idx < 0) return
+    workspaces.value[idx] = {
+      ...workspaces.value[idx],
+      projects: [...projects.value],
+    }
+  }
+
+  async function persistConfig() {
+    writeProjectsToActiveWorkspace()
+    const config: AppConfig = {
+      activeWorkspaceId: activeWorkspaceId.value,
+      workspaces: workspaces.value.map((w) => ({
+        ...w,
+        projects: [...w.projects],
+      })),
+    }
     try {
-      await invoke('save_projects', { projects: projects.value })
+      await invoke('save_app_config', { config })
     } catch (err) {
-      console.error('persistProjects failed', err)
+      console.error('persistConfig failed', err)
+      toastError(`保存配置失败: ${errorMessage(err)}`)
     }
   }
 
   async function loadPersistedState() {
     if (initialized.value) return
     try {
-      const [savedProjects, savedWorkspace] = await Promise.all([
-        invoke<Project[]>('load_projects'),
-        invoke<string | null>('get_workspace_path'),
-      ])
-      projects.value = savedProjects || []
-      workspacePath.value = savedWorkspace
+      const config = await invoke<AppConfig>('load_app_config')
+      const normalized = config?.workspaces?.length > 0 ? config : defaultConfig()
+
+      workspaces.value = normalized.workspaces
+      activeWorkspaceId.value = normalized.workspaces.some(
+        (w) => w.id === normalized.activeWorkspaceId
+      )
+        ? normalized.activeWorkspaceId
+        : normalized.workspaces[0].id
+      syncActiveProjectsFromWorkspaces()
       initialized.value = true
     } catch (err) {
+      const fallback = defaultConfig()
+      workspaces.value = fallback.workspaces
+      activeWorkspaceId.value = fallback.activeWorkspaceId
+      syncActiveProjectsFromWorkspaces()
       toastError(`加载配置失败: ${errorMessage(err)}`)
       initialized.value = true
     }
@@ -94,6 +198,113 @@ export const useProjectStore = defineStore('project', () => {
 
   function selectProject(path: string | null) {
     selectedProjectPath.value = path
+    selectedRunId.value = null
+  }
+
+  function selectRun(runId: string | null) {
+    if (!runId) {
+      selectedRunId.value = null
+      selectedProjectPath.value = null
+      return
+    }
+    const run = runningRuns.value.get(runId)
+    selectedRunId.value = runId
+    selectedProjectPath.value = run?.project.path ?? pathFromRunId(runId) ?? null
+  }
+
+  function clearSelection() {
+    selectedProjectPath.value = null
+    selectedRunId.value = null
+  }
+
+  async function createWorkspace(name: string) {
+    const trimmed = name.trim()
+    if (!trimmed) {
+      toastWarning('请输入工作区名称')
+      return null
+    }
+    if (workspaces.value.some((w) => w.name === trimmed)) {
+      toastWarning('已存在同名工作区')
+      return null
+    }
+
+    if (runningRuns.value.size > 0) {
+      await stopAllProjects()
+    }
+
+    writeProjectsToActiveWorkspace()
+    const id = await invoke<string>('create_workspace_id')
+    const ws: Workspace = { id, name: trimmed, projects: [] }
+    workspaces.value.push(ws)
+    activeWorkspaceId.value = id
+    projects.value = []
+    selectedProjectPath.value = null
+    selectedRunId.value = null
+    await persistConfig()
+    return ws
+  }
+
+  async function switchWorkspace(id: string) {
+    if (id === activeWorkspaceId.value) return
+    const target = workspaces.value.find((w) => w.id === id)
+    if (!target) {
+      toastWarning('工作区不存在')
+      return
+    }
+
+    if (runningRuns.value.size > 0) {
+      await stopAllProjects()
+    }
+
+    writeProjectsToActiveWorkspace()
+    activeWorkspaceId.value = id
+    syncActiveProjectsFromWorkspaces()
+    selectedProjectPath.value = null
+    selectedRunId.value = null
+    erroredRuns.value.clear()
+    await persistConfig()
+  }
+
+  async function renameWorkspace(id: string, name: string) {
+    const trimmed = name.trim()
+    if (!trimmed) {
+      toastWarning('请输入工作区名称')
+      return
+    }
+    if (workspaces.value.some((w) => w.id !== id && w.name === trimmed)) {
+      toastWarning('已存在同名工作区')
+      return
+    }
+    const idx = workspaces.value.findIndex((w) => w.id === id)
+    if (idx < 0) return
+    workspaces.value[idx] = { ...workspaces.value[idx], name: trimmed }
+    await persistConfig()
+  }
+
+  async function deleteWorkspace(id: string) {
+    if (workspaces.value.length <= 1) {
+      toastWarning('至少保留一个工作区')
+      return
+    }
+    const idx = workspaces.value.findIndex((w) => w.id === id)
+    if (idx < 0) return
+
+    if (id === activeWorkspaceId.value && runningRuns.value.size > 0) {
+      await stopAllProjects()
+    }
+
+    writeProjectsToActiveWorkspace()
+    workspaces.value.splice(idx, 1)
+
+    if (activeWorkspaceId.value === id) {
+      activeWorkspaceId.value = workspaces.value[0].id
+      syncActiveProjectsFromWorkspaces()
+      selectedProjectPath.value = null
+      selectedRunId.value = null
+      erroredRuns.value.clear()
+    }
+
+    await persistConfig()
   }
 
   async function addProject(path: string) {
@@ -109,54 +320,64 @@ export const useProjectStore = defineStore('project', () => {
       } else {
         projects.value.push(result)
       }
-      await persistProjects()
+      await persistConfig()
     } catch (err) {
       toastError(`添加项目失败: ${errorMessage(err)}`)
       throw err
     }
   }
 
+  async function importFromDirectory(path: string) {
+    try {
+      const scanned = await invoke<Project[]>('scan_directory', { path })
+      const byPath = new Map(projects.value.map((p) => [p.path, p]))
+      for (const project of scanned) {
+        byPath.set(project.path, project)
+      }
+      projects.value = Array.from(byPath.values())
+      await persistConfig()
+      return scanned.length
+    } catch (err) {
+      toastError(`导入失败: ${errorMessage(err)}`)
+      throw err
+    }
+  }
+
+  async function stopAllScriptsForProject(project: Project) {
+    const scripts = runningScriptsFor(project.path)
+    for (const script of scripts) {
+      await stopProject(project, script)
+    }
+  }
+
   async function removeProject(project: Project) {
     try {
-      if (runningProjects.value.has(project.path)) {
-        await stopProject(project)
-      }
+      await stopAllScriptsForProject(project)
       projects.value = projects.value.filter((p) => p.path !== project.path)
-      runningProjects.value.delete(project.path)
-      projectLogs.value.delete(project.path)
-      projectPorts.value.delete(project.path)
-      erroredProjectPaths.value.delete(project.path)
-      if (selectedProjectPath.value === project.path) {
-        selectedProjectPath.value = null
+      for (const [runId, run] of [...runningRuns.value.entries()]) {
+        if (run.project.path === project.path) runningRuns.value.delete(runId)
       }
-      await persistProjects()
+      for (const [runId, run] of [...erroredRuns.value.entries()]) {
+        if (run.project.path === project.path) erroredRuns.value.delete(runId)
+      }
+      for (const runId of [...runLogs.value.keys()]) {
+        if (runId.startsWith(pathToProjectId(project.path) + '@') || pathFromRunId(runId) === project.path) {
+          runLogs.value.delete(runId)
+          runPorts.value.delete(runId)
+        }
+      }
+      if (selectedProjectPath.value === project.path) {
+        clearSelection()
+      }
+      await persistConfig()
     } catch (err) {
       toastError(`删除项目失败: ${errorMessage(err)}`)
       throw err
     }
   }
 
-  async function scanWorkspace(path: string) {
-    try {
-      const scanned = await invoke<Project[]>('scan_directory', { path })
-      await invoke('set_workspace_path', { path })
-      workspacePath.value =
-        (await invoke<string | null>('get_workspace_path')) || path
-
-      const byPath = new Map(projects.value.map((p) => [p.path, p]))
-      for (const project of scanned) {
-        byPath.set(project.path, project)
-      }
-      projects.value = Array.from(byPath.values())
-      await persistProjects()
-      return scanned.length
-    } catch (err) {
-      toastError(`扫描工作区失败: ${errorMessage(err)}`)
-      throw err
-    }
-  }
-
   async function startProject(project: Project, script: string) {
+    const runId = runIdFor(project.path, script)
     try {
       const result = await invoke<{ success: boolean; message: string; project_id: string }>(
         'start_project',
@@ -164,141 +385,220 @@ export const useProjectStore = defineStore('project', () => {
       )
 
       if (result.success) {
-        erroredProjectPaths.value.delete(project.path)
-        runningProjects.value.set(project.path, {
+        erroredRuns.value.delete(runId)
+        const id = result.project_id || runId
+        runningRuns.value.set(id, {
+          runId: id,
           project,
           script,
           packageManager: packageManager.value,
-          isRunning: true,
         })
-        if (!projectLogs.value.has(project.path)) {
-          projectLogs.value.set(project.path, [])
+        if (!runLogs.value.has(id)) {
+          runLogs.value.set(id, [])
         }
         todayStartCount.value += 1
       }
 
       return result
     } catch (err) {
-      runningProjects.value.delete(project.path)
+      runningRuns.value.delete(runId)
       toastError(`启动失败: ${errorMessage(err)}`)
       return { success: false, message: errorMessage(err), project_id: '' }
     }
   }
 
-  async function stopProject(project: Project) {
+  async function installProject(project: Project) {
+    const runId = runIdFor(project.path, 'install')
     try {
-      await invoke('stop_project', { path: project.path })
-      runningProjects.value.delete(project.path)
-      projectPorts.value.delete(project.path)
+      const result = await invoke<{ success: boolean; message: string; project_id: string }>(
+        'install_project',
+        { path: project.path, packageManager: packageManager.value }
+      )
+
+      if (result.success) {
+        erroredRuns.value.delete(runId)
+        const id = result.project_id || runId
+        runningRuns.value.set(id, {
+          runId: id,
+          project,
+          script: 'install',
+          packageManager: packageManager.value,
+        })
+        if (!runLogs.value.has(id)) {
+          runLogs.value.set(id, [])
+        }
+      }
+
+      return result
     } catch (err) {
+      runningRuns.value.delete(runId)
+      toastError(`安装失败: ${errorMessage(err)}`)
+      return { success: false, message: errorMessage(err), project_id: '' }
+    }
+  }
+
+  async function stopProject(project: Project, script: string) {
+    const runId = runIdFor(project.path, script)
+    try {
+      await invoke('stop_project', { path: project.path, script })
+      runningRuns.value.delete(runId)
+      runPorts.value.delete(runId)
+      if (selectedRunId.value === runId) {
+        clearSelection()
+      }
+    } catch (err) {
+      runningRuns.value.delete(runId)
+      runPorts.value.delete(runId)
+      if (selectedRunId.value === runId) {
+        clearSelection()
+      }
       toastError(`停止失败: ${errorMessage(err)}`)
       throw err
     }
   }
 
-  async function restartProject(project: Project) {
-    const running = runningProjects.value.get(project.path)
-    const script = running?.script
-    if (!script) {
-      toastWarning('项目未在运行，无法重启')
-      return { success: false, message: '项目未在运行', project_id: '' }
+  async function restartProject(project: Project, script: string) {
+    if (script === 'install') {
+      toastWarning('安装完成后请手动启动脚本')
+      return { success: false, message: '无法重启', project_id: '' }
     }
-    await stopProject(project)
+    if (isScriptRunning(project.path, script)) {
+      await stopProject(project, script)
+    }
     return startProject(project, script)
   }
 
   async function stopAllProjects() {
     try {
       await invoke('stop_all_projects')
-      runningProjects.value.clear()
-      projectPorts.value.clear()
+      runningRuns.value.clear()
+      runPorts.value.clear()
+      if (selectedRunId.value) clearSelection()
     } catch (err) {
+      runningRuns.value.clear()
+      runPorts.value.clear()
+      if (selectedRunId.value) clearSelection()
       toastError(`一键全停失败: ${errorMessage(err)}`)
       throw err
     }
   }
 
-  function markStopped(projectId: string) {
-    const projectPath = pathFromProjectId(projectId)
-    if (!projectPath) return
-    runningProjects.value.delete(projectPath)
-    projectPorts.value.delete(projectPath)
+  function markStopped(runId: string) {
+    runningRuns.value.delete(runId)
+    runPorts.value.delete(runId)
+    if (selectedRunId.value === runId) {
+      clearSelection()
+    }
   }
 
-  function markExited(projectId: string, success: boolean) {
-    const projectPath = pathFromProjectId(projectId)
-    if (!projectPath) return
-    runningProjects.value.delete(projectPath)
-    projectPorts.value.delete(projectPath)
-    if (!success) {
-      erroredProjectPaths.value.add(projectPath)
+  function markExited(runId: string, success: boolean) {
+    const run = runningRuns.value.get(runId)
+    runningRuns.value.delete(runId)
+    runPorts.value.delete(runId)
+    if (selectedRunId.value === runId) {
+      clearSelection()
+    }
+
+    if (!success && run) {
+      erroredRuns.value.set(runId, {
+        runId,
+        project: run.project,
+        script: run.script,
+      })
     } else {
-      erroredProjectPaths.value.delete(projectPath)
+      erroredRuns.value.delete(runId)
     }
   }
 
-  function addPort(projectPath: string, port: string) {
-    const ports = projectPorts.value.get(projectPath) || []
+  function addPort(runId: string, port: string) {
+    const ports = runPorts.value.get(runId) || []
     if (!ports.includes(port)) {
-      ports.push(port)
-      projectPorts.value.set(projectPath, ports)
+      runPorts.value.set(runId, [...ports, port])
     }
   }
 
-  function clearPorts(projectPath: string) {
-    projectPorts.value.set(projectPath, [])
+  function clearPorts(runId: string) {
+    runPorts.value.set(runId, [])
   }
 
-  function addLog(projectPath: string, log: string) {
-    const logs = projectLogs.value.get(projectPath) || []
+  function portsForRun(runId: string): string[] {
+    return runPorts.value.get(runId) || []
+  }
+
+  function addLog(runId: string, log: string) {
+    const logs = runLogs.value.get(runId) || []
     logs.push(log)
     if (logs.length > MAX_LOG_LINES) {
       logs.splice(0, logs.length - MAX_LOG_LINES)
     }
-    projectLogs.value.set(projectPath, [...logs])
+    runLogs.value.set(runId, [...logs])
   }
 
-  function clearLogs(projectPath: string) {
-    projectLogs.value.set(projectPath, [])
+  function clearLogs(runId: string) {
+    runLogs.value.set(runId, [])
   }
 
-  function clearError(projectPath: string) {
-    erroredProjectPaths.value.delete(projectPath)
+  function logsForRun(runId: string): string[] {
+    return runLogs.value.get(runId) || []
+  }
+
+  function clearError(runId: string) {
+    erroredRuns.value.delete(runId)
   }
 
   return {
+    workspaces,
+    activeWorkspaceId,
+    activeWorkspace,
+    activeWorkspaceName,
     projects,
-    runningProjects,
-    projectLogs,
-    projectPorts,
-    erroredProjectPaths,
+    runningRuns,
+    runLogs,
+    runPorts,
+    erroredRuns,
     selectedProjectPath,
+    selectedRunId,
     selectedProject,
+    selectedRun,
+    detailMode,
     packageManager,
-    workspacePath,
     todayStartCount,
     totalProjects,
     runningCount,
     erroredCount,
-    runningProjectList,
-    stoppedProjects,
-    erroredProjects,
+    runningRunList,
+    erroredRunList,
     loadPersistedState,
+    createWorkspace,
+    switchWorkspace,
+    renameWorkspace,
+    deleteWorkspace,
     addProject,
+    importFromDirectory,
     removeProject,
-    scanWorkspace,
     selectProject,
+    selectRun,
+    clearSelection,
     startProject,
+    installProject,
     stopProject,
     restartProject,
     stopAllProjects,
+    stopAllScriptsForProject,
     markStopped,
     markExited,
-    pathFromProjectId,
+    pathFromRunId,
+    resolveRunId,
+    runIdFor,
+    isScriptRunning,
+    runningScriptsFor,
+    hasRunningScripts,
     addPort,
     clearPorts,
+    portsForRun,
     addLog,
     clearLogs,
+    logsForRun,
     clearError,
   }
 })

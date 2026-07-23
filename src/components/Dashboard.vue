@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { open as openUrl } from '@tauri-apps/plugin-shell'
 import { useProjectStore, type Project } from '@/stores/project'
@@ -6,6 +7,10 @@ import ProjectDetail from './ProjectDetail.vue'
 import { toastSuccess, toastError } from '@/utils/toast'
 
 const store = useProjectStore()
+const showWorkspacePanel = ref(false)
+const newWorkspaceName = ref('')
+const renamingId = ref<string | null>(null)
+const renameValue = ref('')
 
 async function handleAddProject() {
   try {
@@ -19,12 +24,60 @@ async function handleAddProject() {
   }
 }
 
-async function handleSelectWorkspace() {
+async function handleImportDirectory() {
   try {
-    const result = await openDialog({ directory: true, title: '选择工作区根目录' })
+    const result = await openDialog({ directory: true, title: '选择要扫描的目录' })
     if (!result) return
-    const count = await store.scanWorkspace(result.toString())
-    toastSuccess(`工作区扫描完成，发现 ${count} 个项目`)
+    const count = await store.importFromDirectory(result.toString())
+    toastSuccess(`已导入 ${count} 个项目到「${store.activeWorkspaceName}」`)
+    showWorkspacePanel.value = false
+  } catch (err: unknown) {
+    toastError(String(err))
+  }
+}
+
+async function handleCreateWorkspace() {
+  const ws = await store.createWorkspace(newWorkspaceName.value)
+  if (ws) {
+    toastSuccess(`已创建工作区「${ws.name}」`)
+    newWorkspaceName.value = ''
+  }
+}
+
+async function handleSwitchWorkspace(id: string) {
+  try {
+    await store.switchWorkspace(id)
+    toastSuccess(`已切换到「${store.activeWorkspaceName}」`)
+    showWorkspacePanel.value = false
+  } catch (err: unknown) {
+    toastError(String(err))
+  }
+}
+
+function startRename(id: string, name: string) {
+  renamingId.value = id
+  renameValue.value = name
+}
+
+async function confirmRename() {
+  if (!renamingId.value) return
+  try {
+    await store.renameWorkspace(renamingId.value, renameValue.value)
+    toastSuccess('已重命名')
+    renamingId.value = null
+    renameValue.value = ''
+  } catch (err: unknown) {
+    toastError(String(err))
+  }
+}
+
+async function handleDeleteWorkspace(id: string, name: string) {
+  if (!window.confirm(`确定删除工作区「${name}」？其中的项目关联会一并移除（不会删除磁盘文件）。`)) {
+    return
+  }
+  try {
+    await store.deleteWorkspace(id)
+    toastSuccess('工作区已删除')
   } catch (err: unknown) {
     toastError(String(err))
   }
@@ -38,22 +91,36 @@ function handleProjectClick(project: Project) {
   store.selectProject(project.path)
 }
 
+function handleRunClick(runId: string) {
+  store.selectRun(runId)
+}
+
 function handleCloseDetail() {
-  store.selectProject(null)
+  store.clearSelection()
 }
 
-function getCurrentScript(project: Project) {
-  return store.runningProjects.get(project.path)?.script || ''
+function getRunPorts(runId: string) {
+  return store.portsForRun(runId)
 }
 
-function getProjectPorts(project: Project) {
-  return store.projectPorts.get(project.path) || []
+function runningScriptsLabel(project: Project) {
+  const scripts = store.runningScriptsFor(project.path)
+  return scripts.length ? scripts.join(', ') : ''
 }
 
 async function handleStopAll() {
   try {
     await store.stopAllProjects()
     toastSuccess('已停止所有项目')
+  } catch {
+    // store already shows error
+  }
+}
+
+async function handleStopProject(project: Project, script: string) {
+  try {
+    await store.stopProject(project, script)
+    toastSuccess(`已停止 ${project.name} / ${script}`)
   } catch {
     // store already shows error
   }
@@ -67,6 +134,10 @@ async function handleRemoveProject(project: Project) {
     // store already shows error
   }
 }
+
+function handleClearError(runId: string) {
+  store.clearError(runId)
+}
 </script>
 
 <template>
@@ -74,9 +145,7 @@ async function handleRemoveProject(project: Project) {
     <header class="header">
       <div class="header-left">
         <h1 class="title">Project Launcher</h1>
-        <p v-if="store.workspacePath" class="subtitle" :title="store.workspacePath">
-          工作区: {{ store.workspacePath }}
-        </p>
+        <p class="subtitle">工作区: {{ store.activeWorkspaceName }}</p>
       </div>
       <div class="header-right">
         <div class="stats">
@@ -98,9 +167,7 @@ async function handleRemoveProject(project: Project) {
           </div>
         </div>
         <div class="actions">
-          <button class="btn btn-outline" @click="handleSelectWorkspace">
-            {{ store.workspacePath ? '更换工作区' : '选择工作区' }}
-          </button>
+          <button class="btn btn-outline" @click="showWorkspacePanel = true">工作区</button>
           <button class="btn btn-secondary" @click="handleAddProject">新增项目</button>
           <button class="btn btn-danger" @click="handleStopAll">一键全停</button>
         </div>
@@ -111,8 +178,8 @@ async function handleRemoveProject(project: Project) {
       <section class="column stopped">
         <div class="column-header">
           <span class="column-dot stopped"></span>
-          <h2>待处理</h2>
-          <span class="column-count">{{ store.stoppedProjects.length }}</span>
+          <h2>项目列表</h2>
+          <span class="column-count">{{ store.projects.length }}</span>
         </div>
         <div class="column-body">
           <button class="tile add-tile" @click="handleAddProject">
@@ -126,18 +193,25 @@ async function handleRemoveProject(project: Project) {
           </button>
 
           <div
-            v-for="project in store.stoppedProjects"
+            v-for="project in store.projects"
             :key="project.path"
             class="tile project-tile"
-            :class="{ selected: store.selectedProjectPath === project.path }"
+            :class="{
+              selected:
+                store.selectedProjectPath === project.path && store.detailMode === 'project',
+              running: store.hasRunningScripts(project.path),
+            }"
             @click="handleProjectClick(project)"
           >
             <div class="tile-header">
-              <span class="status-dot stopped"></span>
+              <span
+                class="status-dot"
+                :class="store.hasRunningScripts(project.path) ? 'running' : 'stopped'"
+              ></span>
               <h3 class="project-name">{{ project.name }}</h3>
               <button
                 class="tile-delete"
-                title="删除项目"
+                title="从工作区移除"
                 @click.stop="handleRemoveProject(project)"
               >
                 ×
@@ -146,12 +220,15 @@ async function handleRemoveProject(project: Project) {
             <p class="project-path">{{ project.path }}</p>
             <div class="stopped-info">
               <span class="script-count">{{ project.scripts.length }} 个脚本</span>
+              <span v-if="runningScriptsLabel(project)" class="running-badge">
+                运行中: {{ runningScriptsLabel(project) }}
+              </span>
             </div>
           </div>
 
-          <div v-if="store.stoppedProjects.length === 0" class="empty-column">
-            <p>暂无待处理项目</p>
-            <p class="hint">选择工作区或手动添加</p>
+          <div v-if="store.projects.length === 0" class="empty-column">
+            <p>暂无项目</p>
+            <p class="hint">在当前工作区新增项目，或从目录批量导入</p>
           </div>
         </div>
       </section>
@@ -159,46 +236,47 @@ async function handleRemoveProject(project: Project) {
       <section class="column running">
         <div class="column-header">
           <span class="column-dot running"></span>
-          <h2>进行中</h2>
-          <span class="column-count">{{ store.runningProjectList.length }}</span>
+          <h2>运行中</h2>
+          <span class="column-count">{{ store.runningRunList.length }}</span>
         </div>
         <div class="column-body">
           <div
-            v-for="project in store.runningProjectList"
-            :key="project.path"
+            v-for="run in store.runningRunList"
+            :key="run.runId"
             class="tile project-tile running"
-            :class="{ selected: store.selectedProjectPath === project.path }"
-            @click="handleProjectClick(project)"
+            :class="{ selected: store.selectedRunId === run.runId }"
+            @click="handleRunClick(run.runId)"
           >
             <div class="tile-header">
               <span class="status-dot running"></span>
-              <h3 class="project-name">{{ project.name }}</h3>
+              <h3 class="project-name">{{ run.project.name }}</h3>
               <button
-                class="tile-delete"
-                title="删除项目"
-                @click.stop="handleRemoveProject(project)"
+                class="tile-stop"
+                title="停止该脚本"
+                @click.stop="handleStopProject(run.project, run.script)"
               >
-                ×
+                ■
               </button>
             </div>
-            <p class="project-path">{{ project.path }}</p>
+            <p class="project-path">{{ run.project.path }}</p>
             <div class="running-info">
-              <span class="current-script">运行中: {{ getCurrentScript(project) }}</span>
-              <div v-if="getProjectPorts(project).length > 0" class="ports">
+              <span class="current-script">脚本: {{ run.script }}</span>
+              <div v-if="getRunPorts(run.runId).length > 0" class="ports">
                 <button
-                  v-for="port in getProjectPorts(project).slice(0, 2)"
+                  v-for="port in getRunPorts(run.runId)"
                   :key="port"
                   class="port"
+                  title="在浏览器中打开"
                   @click.stop="handleOpenUrl(port)"
                 >
-                  {{ port }}
+                  http://localhost:{{ port }}
                 </button>
               </div>
             </div>
           </div>
 
-          <div v-if="store.runningProjectList.length === 0" class="empty-column">
-            <p>暂无运行中的项目</p>
+          <div v-if="store.runningRunList.length === 0" class="empty-column">
+            <p>暂无运行中的脚本</p>
           </div>
         </div>
       </section>
@@ -207,41 +285,38 @@ async function handleRemoveProject(project: Project) {
         <div class="column-header">
           <span class="column-dot errored"></span>
           <h2>异常</h2>
-          <span class="column-count">{{ store.erroredProjects.length }}</span>
+          <span class="column-count">{{ store.erroredRunList.length }}</span>
         </div>
         <div class="column-body">
           <div
-            v-for="project in store.erroredProjects"
-            :key="project.path"
+            v-for="run in store.erroredRunList"
+            :key="run.runId"
             class="tile project-tile errored"
-            :class="{ selected: store.selectedProjectPath === project.path }"
-            @click="handleProjectClick(project)"
+            :class="{ selected: store.selectedProjectPath === run.project.path }"
+            @click="handleProjectClick(run.project)"
           >
             <div class="tile-header">
               <span class="status-dot errored"></span>
-              <h3 class="project-name">{{ project.name }}</h3>
+              <h3 class="project-name">{{ run.project.name }}</h3>
               <button
                 class="tile-delete"
-                title="删除项目"
-                @click.stop="handleRemoveProject(project)"
+                title="清除记录"
+                @click.stop="handleClearError(run.runId)"
               >
                 ×
               </button>
             </div>
-            <p class="project-path">{{ project.path }}</p>
+            <p class="project-path">{{ run.project.path }}</p>
             <div class="errored-info">
-              <span class="error-text">异常退出</span>
-              <button
-                class="dismiss-btn"
-                @click.stop="store.clearError(project.path)"
-              >
+              <span class="error-text">{{ run.script }} 异常退出</span>
+              <button class="dismiss-btn" @click.stop="handleClearError(run.runId)">
                 清除
               </button>
             </div>
           </div>
 
-          <div v-if="store.erroredProjects.length === 0" class="empty-column">
-            <p>暂无异常项目</p>
+          <div v-if="store.erroredRunList.length === 0" class="empty-column">
+            <p>暂无异常记录</p>
           </div>
         </div>
       </section>
@@ -250,8 +325,78 @@ async function handleRemoveProject(project: Project) {
     <ProjectDetail
       v-if="store.selectedProject"
       :project="store.selectedProject"
+      :mode="store.detailMode"
+      :run-id="store.selectedRunId"
       @close="handleCloseDetail"
     />
+
+    <div
+      v-if="showWorkspacePanel"
+      class="ws-overlay"
+      @click.self="showWorkspacePanel = false"
+    >
+      <div class="ws-panel">
+        <div class="ws-header">
+          <h2>工作区管理</h2>
+          <button class="close-btn" @click="showWorkspacePanel = false">×</button>
+        </div>
+        <p class="ws-hint">工作区是项目分组名称，用于分类管理；配置会保存到本地 JSON。</p>
+
+        <div class="ws-create">
+          <input
+            v-model="newWorkspaceName"
+            class="ws-input"
+            placeholder="新建工作区名称"
+            @keyup.enter="handleCreateWorkspace"
+          />
+          <button class="btn btn-secondary" @click="handleCreateWorkspace">创建</button>
+        </div>
+
+        <div class="ws-list">
+          <div
+            v-for="ws in store.workspaces"
+            :key="ws.id"
+            class="ws-item"
+            :class="{ active: ws.id === store.activeWorkspaceId }"
+          >
+            <template v-if="renamingId === ws.id">
+              <input v-model="renameValue" class="ws-input" @keyup.enter="confirmRename" />
+              <button class="ws-mini" @click="confirmRename">保存</button>
+              <button class="ws-mini" @click="renamingId = null">取消</button>
+            </template>
+            <template v-else>
+              <div class="ws-meta" @click="handleSwitchWorkspace(ws.id)">
+                <span class="ws-name">{{ ws.name }}</span>
+                <span class="ws-count">{{ ws.projects.length }} 个项目</span>
+              </div>
+              <div class="ws-actions">
+                <button
+                  v-if="ws.id !== store.activeWorkspaceId"
+                  class="ws-mini"
+                  @click="handleSwitchWorkspace(ws.id)"
+                >
+                  切换
+                </button>
+                <button class="ws-mini" @click="startRename(ws.id, ws.name)">重命名</button>
+                <button
+                  class="ws-mini danger"
+                  :disabled="store.workspaces.length <= 1"
+                  @click="handleDeleteWorkspace(ws.id, ws.name)"
+                >
+                  删除
+                </button>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <div class="ws-footer">
+          <button class="btn btn-outline" @click="handleImportDirectory">
+            从目录导入到当前工作区
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -532,6 +677,24 @@ async function handleRemoveProject(project: Project) {
   color: #f87171;
 }
 
+.tile-stop {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.tile-stop:hover {
+  background: rgba(239, 68, 68, 0.3);
+}
+
 .status-dot {
   width: 8px;
   height: 8px;
@@ -577,13 +740,25 @@ async function handleRemoveProject(project: Project) {
 }
 
 .running-info,
-.stopped-info,
 .errored-info {
   margin-top: auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+.stopped-info {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.running-badge {
+  font-size: 12px;
+  color: #4ade80;
 }
 
 .current-script {
@@ -612,6 +787,13 @@ async function handleRemoveProject(project: Project) {
 
 .port:hover {
   background: rgba(74, 222, 128, 0.3);
+  text-decoration: underline;
+}
+
+.waiting-port {
+  margin-top: 6px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.35);
 }
 
 .script-count,
@@ -657,6 +839,146 @@ async function handleRemoveProject(project: Project) {
 .empty-column .hint {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.28);
+}
+
+.ws-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.ws-panel {
+  width: min(520px, 100%);
+  max-height: 80vh;
+  overflow: auto;
+  background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ws-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ws-header h2 {
+  margin: 0;
+  color: #fff;
+  font-size: 18px;
+}
+
+.ws-header .close-btn {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 24px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.ws-hint {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.45);
+  line-height: 1.5;
+}
+
+.ws-create,
+.ws-footer {
+  display: flex;
+  gap: 10px;
+}
+
+.ws-input {
+  flex: 1;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff;
+  outline: none;
+}
+
+.ws-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ws-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.ws-item.active {
+  border-color: rgba(102, 126, 234, 0.5);
+  background: rgba(102, 126, 234, 0.12);
+}
+
+.ws-meta {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ws-name {
+  color: #fff;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.ws-count {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 12px;
+}
+
+.ws-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ws-mini {
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.ws-mini:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.ws-mini.danger {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.ws-mini:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 @media (max-width: 960px) {

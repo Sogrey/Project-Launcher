@@ -7,6 +7,8 @@ import '@xterm/xterm/css/xterm.css'
 const props = defineProps<{
   projectPath: string
   logs: string[]
+  /** Stretch to fill parent (run-mode drawer). */
+  fill?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -88,7 +90,7 @@ function handleFit() {
 </script>
 
 <template>
-  <div class="log-panel" @click="handleFit">
+  <div class="log-panel" :class="{ fill: fill }" @click="handleFit">
     <div class="log-header">
       <span class="log-title">日志输出</span>
       <div class="log-controls">
@@ -113,12 +115,20 @@ function handleFit() {
   overflow: hidden;
 }
 
+.log-panel.fill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .log-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 8px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  flex-shrink: 0;
 }
 
 .log-title {
@@ -164,6 +174,12 @@ function handleFit() {
   height: 200px;
   overflow: hidden;
   padding: 4px;
+}
+
+.log-panel.fill .log-content {
+  height: auto;
+  flex: 1;
+  min-height: 180px;
 }
 
 .log-content :deep(.xterm) {

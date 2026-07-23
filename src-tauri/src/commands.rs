@@ -18,8 +18,11 @@ use std::os::windows::process::CommandExt;
 
 lazy_static::lazy_static! {
   static ref RUNNING_PROCESSES: Mutex<HashMap<String, Child>> = Mutex::new(HashMap::new());
-  static ref PORT_RE: Regex = Regex::new(r":(\d{4,5})").unwrap();
   static ref SCRIPT_RE: Regex = Regex::new(r"^[a-zA-Z0-9_:-]+$").unwrap();
+  static ref ANSI_RE: Regex = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap();
+  static ref PORT_URL_RE: Regex =
+    Regex::new(r"(?i)(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})").unwrap();
+  static ref PORT_FALLBACK_RE: Regex = Regex::new(r":(\d{4,5})\b").unwrap();
 }
 
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
@@ -79,6 +82,11 @@ fn project_id_from_path(path: &str) -> String {
   path.replace(|c: char| !c.is_alphanumeric(), "_")
 }
 
+/// Unique run id so one project can run multiple scripts in parallel.
+fn run_id_from(path: &str, script: &str) -> String {
+  format!("{}@{}", project_id_from_path(path), script)
+}
+
 fn project_name_from_path(path: &Path) -> String {
   path
     .file_name()
@@ -93,6 +101,49 @@ fn is_valid_script(script: &str) -> bool {
 
 fn is_valid_package_manager(pm: &str) -> bool {
   matches!(pm, "npm" | "pnpm" | "yarn")
+}
+
+fn strip_ansi(input: &str) -> String {
+  ANSI_RE.replace_all(input, "").to_string()
+}
+
+fn extract_port_from_line(line: &str) -> Option<String> {
+  let plain = strip_ansi(line);
+  if let Some(captures) = PORT_URL_RE.captures(&plain) {
+    return Some(captures[1].to_string());
+  }
+
+  let lower = plain.to_lowercase();
+  if lower.contains("local:")
+    || lower.contains("localhost")
+    || lower.contains("network:")
+    || lower.contains("127.0.0.1")
+  {
+    if let Some(captures) = PORT_FALLBACK_RE.captures(&plain) {
+      return Some(captures[1].to_string());
+    }
+  }
+
+  None
+}
+
+fn pm_program(package_manager: &str) -> &'static str {
+  #[cfg(windows)]
+  {
+    match package_manager {
+      "pnpm" => "pnpm.cmd",
+      "yarn" => "yarn.cmd",
+      _ => "npm.cmd",
+    }
+  }
+  #[cfg(not(windows))]
+  {
+    match package_manager {
+      "pnpm" => "pnpm",
+      "yarn" => "yarn",
+      _ => "npm",
+    }
+  }
 }
 
 fn kill_process_tree(child: &mut Child) {
@@ -127,7 +178,7 @@ fn kill_process_tree(child: &mut Child) {
   let _ = child.wait();
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
   pub name: String,
   pub path: String,
@@ -206,7 +257,6 @@ fn spawn_log_reader<R: std::io::Read + Send + 'static>(
   app: AppHandle,
   project_id: String,
   reader: R,
-  extract_ports: bool,
   readers_done: Arc<AtomicUsize>,
 ) {
   thread::spawn(move || {
@@ -222,11 +272,8 @@ fn spawn_log_reader<R: std::io::Read + Send + 'static>(
           let line = line_buf.trim_end_matches(['\r', '\n']).to_string();
           line_buf.clear();
 
-          if extract_ports && (line.contains("Local:") || line.contains("localhost:")) {
-            if let Some(captures) = PORT_RE.captures(&line) {
-              let port = captures[1].to_string();
-              let _ = app.emit("project:port", (project_id.clone(), port));
-            }
+          if let Some(port) = extract_port_from_line(&line) {
+            let _ = app.emit("project:port", (project_id.clone(), port));
           }
 
           batch.push(line);
@@ -245,6 +292,43 @@ fn spawn_log_reader<R: std::io::Read + Send + 'static>(
       reap_and_emit_exit(&app, &project_id);
     }
   });
+}
+
+fn begin_tracked_process(
+  app_handle: AppHandle,
+  project_id: String,
+  mut child: Child,
+) -> Result<(), String> {
+  let stdout = match child.stdout.take() {
+    Some(s) => s,
+    None => {
+      let _ = child.kill();
+      return Err("无法获取标准输出".to_string());
+    }
+  };
+
+  let stderr = match child.stderr.take() {
+    Some(s) => s,
+    None => {
+      let _ = child.kill();
+      return Err("无法获取错误输出".to_string());
+    }
+  };
+
+  {
+    let mut processes = lock_processes();
+    processes.insert(project_id.clone(), child);
+  }
+
+  let readers_done = Arc::new(AtomicUsize::new(0));
+  spawn_log_reader(
+    app_handle.clone(),
+    project_id.clone(),
+    stdout,
+    readers_done.clone(),
+  );
+  spawn_log_reader(app_handle, project_id, stderr, readers_done);
+  Ok(())
 }
 
 fn reap_and_emit_exit(app: &AppHandle, project_id: &str) {
@@ -304,20 +388,20 @@ pub fn start_project(
       return StartResult {
         success: false,
         message,
-        project_id: project_id_from_path(&path),
+        project_id: run_id_from(&path, &script),
       };
     }
   };
-  // Keep caller path for project_id so frontend Map keys and IPC events stay aligned.
-  let project_id = project_id_from_path(&path);
 
   if !is_valid_script(&script) {
     return StartResult {
       success: false,
       message: "非法脚本名：仅允许字母、数字、下划线、连字符和冒号".to_string(),
-      project_id,
+      project_id: run_id_from(&path, &script),
     };
   }
+
+  let project_id = run_id_from(&path, &script);
 
   if !is_valid_package_manager(&package_manager) {
     return StartResult {
@@ -332,33 +416,20 @@ pub fn start_project(
     if processes.len() >= MAX_RUNNING_PROCESSES {
       return StartResult {
         success: false,
-        message: format!("同时运行项目数不能超过 {}", MAX_RUNNING_PROCESSES),
+        message: format!("同时运行进程数不能超过 {}", MAX_RUNNING_PROCESSES),
         project_id,
       };
     }
     if processes.contains_key(&project_id) {
       return StartResult {
         success: false,
-        message: "项目已在运行中".to_string(),
+        message: format!("脚本 {} 已在运行中", script),
         project_id,
       };
     }
   }
 
-  // Avoid shell metacharacter injection: invoke package manager with discrete args.
-  #[cfg(windows)]
-  let program = match package_manager.as_str() {
-    "pnpm" => "pnpm.cmd",
-    "yarn" => "yarn.cmd",
-    _ => "npm.cmd",
-  };
-  #[cfg(not(windows))]
-  let program = match package_manager.as_str() {
-    "pnpm" => "pnpm",
-    "yarn" => "yarn",
-    _ => "npm",
-  };
-
+  let program = pm_program(&package_manager);
   let mut cmd = Command::new(program);
   match package_manager.as_str() {
     "yarn" => {
@@ -368,22 +439,23 @@ pub fn start_project(
       cmd.arg("run").arg(&script);
     }
   }
-  cmd.current_dir(&validated_path);
+  let workdir = path_to_string(&validated_path);
+  cmd.current_dir(&workdir);
   cmd.env("FORCE_COLOR", "1");
+  cmd.stdin(Stdio::null());
   cmd.stdout(Stdio::piped());
   cmd.stderr(Stdio::piped());
 
   #[cfg(windows)]
-  cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+  cmd.creation_flags(0x08000000);
 
   #[cfg(unix)]
   {
     use std::os::unix::process::CommandExt;
-    // Put the child in its own process group so we can kill the whole tree.
     cmd.process_group(0);
   }
 
-  let mut child = match cmd.spawn() {
+  let child = match cmd.spawn() {
     Ok(c) => c,
     Err(e) => {
       return StartResult {
@@ -394,51 +466,13 @@ pub fn start_project(
     }
   };
 
-  let stdout = match child.stdout.take() {
-    Some(s) => s,
-    None => {
-      let _ = child.kill();
-      return StartResult {
-        success: false,
-        message: "无法获取标准输出".to_string(),
-        project_id,
-      };
-    }
-  };
-
-  let stderr = match child.stderr.take() {
-    Some(s) => s,
-    None => {
-      let _ = child.kill();
-      return StartResult {
-        success: false,
-        message: "无法获取错误输出".to_string(),
-        project_id,
-      };
-    }
-  };
-
-  {
-    let mut processes = lock_processes();
-    processes.insert(project_id.clone(), child);
+  if let Err(message) = begin_tracked_process(app_handle, project_id.clone(), child) {
+    return StartResult {
+      success: false,
+      message,
+      project_id,
+    };
   }
-
-  let readers_done = Arc::new(AtomicUsize::new(0));
-
-  spawn_log_reader(
-    app_handle.clone(),
-    project_id.clone(),
-    stdout,
-    true,
-    readers_done.clone(),
-  );
-  spawn_log_reader(
-    app_handle,
-    project_id.clone(),
-    stderr,
-    false,
-    readers_done,
-  );
 
   StartResult {
     success: true,
@@ -448,9 +482,102 @@ pub fn start_project(
 }
 
 #[tauri::command]
-pub fn stop_project(app_handle: AppHandle, path: String) -> Result<bool, String> {
+pub fn install_project(
+  app_handle: AppHandle,
+  path: String,
+  package_manager: String,
+) -> StartResult {
+  let script = "install".to_string();
+  let validated_path = match validate_dir_path(&path) {
+    Ok(p) => p,
+    Err(message) => {
+      return StartResult {
+        success: false,
+        message,
+        project_id: run_id_from(&path, &script),
+      };
+    }
+  };
+  let project_id = run_id_from(&path, &script);
+
+  if !is_valid_package_manager(&package_manager) {
+    return StartResult {
+      success: false,
+      message: "不支持的包管理器".to_string(),
+      project_id,
+    };
+  }
+
+  {
+    let processes = lock_processes();
+    if processes.len() >= MAX_RUNNING_PROCESSES {
+      return StartResult {
+        success: false,
+        message: format!("同时运行进程数不能超过 {}", MAX_RUNNING_PROCESSES),
+        project_id,
+      };
+    }
+    if processes.contains_key(&project_id) {
+      return StartResult {
+        success: false,
+        message: "依赖安装已在进行中".to_string(),
+        project_id,
+      };
+    }
+  }
+
+  let program = pm_program(&package_manager);
+  let mut cmd = Command::new(program);
+  cmd.arg("install");
+  let workdir = path_to_string(&validated_path);
+  cmd.current_dir(&workdir);
+  cmd.env("FORCE_COLOR", "1");
+  cmd.stdin(Stdio::null());
+  cmd.stdout(Stdio::piped());
+  cmd.stderr(Stdio::piped());
+
+  #[cfg(windows)]
+  cmd.creation_flags(0x08000000);
+
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+  }
+
+  let child = match cmd.spawn() {
+    Ok(c) => c,
+    Err(e) => {
+      return StartResult {
+        success: false,
+        message: format!("安装启动失败: {}", e),
+        project_id,
+      };
+    }
+  };
+
+  if let Err(message) = begin_tracked_process(app_handle, project_id.clone(), child) {
+    return StartResult {
+      success: false,
+      message,
+      project_id,
+    };
+  }
+
+  StartResult {
+    success: true,
+    message: "依赖安装已开始".to_string(),
+    project_id,
+  }
+}
+
+#[tauri::command]
+pub fn stop_project(app_handle: AppHandle, path: String, script: String) -> Result<bool, String> {
   validate_path_input(&path)?;
-  let project_id = project_id_from_path(&path);
+  if script != "install" && !is_valid_script(&script) {
+    return Err("非法脚本名".to_string());
+  }
+  let project_id = run_id_from(&path, &script);
 
   let child = {
     let mut processes = lock_processes();
@@ -486,47 +613,107 @@ fn open_config_store(app_handle: &AppHandle) -> Option<std::sync::Arc<tauri_plug
   app_handle.store("config.json").ok()
 }
 
-#[tauri::command]
-pub fn get_workspace_path(app_handle: AppHandle) -> Option<String> {
-  let store = open_config_store(&app_handle)?;
-  store
-    .get("workspace_path")
-    .and_then(|v| v.as_str().map(|s| s.to_string()))
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Workspace {
+  pub id: String,
+  pub name: String,
+  pub projects: Vec<Project>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfig {
+  pub active_workspace_id: String,
+  pub workspaces: Vec<Workspace>,
+}
+
+fn new_workspace_id() -> String {
+  format!(
+    "ws_{}",
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0)
+  )
+}
+
+fn default_app_config() -> AppConfig {
+  let id = "ws_default".to_string();
+  AppConfig {
+    active_workspace_id: id.clone(),
+    workspaces: vec![Workspace {
+      id,
+      name: "默认".to_string(),
+      projects: Vec::new(),
+    }],
+  }
+}
+
+fn read_app_config_from_store(
+  store: &std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>,
+) -> AppConfig {
+  // New format
+  if let Some(value) = store.get("app_config") {
+    if let Ok(config) = serde_json::from_value::<AppConfig>(value.clone()) {
+      if !config.workspaces.is_empty() {
+        return config;
+      }
+    }
+  }
+
+  // Migrate legacy flat projects / workspace_path
+  let legacy_projects: Vec<Project> = store
+    .get("projects")
+    .and_then(|v| serde_json::from_value(v.clone()).ok())
+    .unwrap_or_default();
+
+  let mut config = default_app_config();
+  if let Some(ws) = config.workspaces.first_mut() {
+    ws.projects = legacy_projects;
+  }
+
+  store.set("app_config".to_string(), json!(config));
+  let _ = store.delete("projects");
+  let _ = store.delete("workspace_path");
+  let _ = store.save();
+
+  config
 }
 
 #[tauri::command]
-pub fn set_workspace_path(app_handle: AppHandle, path: String) -> Result<bool, String> {
-  let validated = validate_dir_path(&path)?;
-  let path = path_to_string(&validated);
-  let store = match open_config_store(&app_handle) {
-    Some(s) => s,
-    None => return Err("无法打开配置存储".to_string()),
-  };
-  store.set("workspace_path".to_string(), json!(path));
+pub fn load_app_config(app_handle: AppHandle) -> Result<AppConfig, String> {
+  let store = open_config_store(&app_handle).ok_or_else(|| "无法打开配置存储".to_string())?;
+  let config = read_app_config_from_store(&store);
+  Ok(config)
+}
+
+#[tauri::command]
+pub fn save_app_config(app_handle: AppHandle, config: AppConfig) -> Result<bool, String> {
+  if config.workspaces.is_empty() {
+    return Err("至少需要一个工作区".to_string());
+  }
+  if !config
+    .workspaces
+    .iter()
+    .any(|w| w.id == config.active_workspace_id)
+  {
+    return Err("activeWorkspaceId 不存在".to_string());
+  }
+
+  let store = open_config_store(&app_handle).ok_or_else(|| "无法打开配置存储".to_string())?;
+  store.set("app_config".to_string(), json!(config));
+  // Ensure legacy keys are gone after adopting the new model.
+  let _ = store.delete("projects");
+  let _ = store.delete("workspace_path");
   store
     .save()
     .map(|_| true)
-    .map_err(|e| format!("保存工作区失败: {}", e))
+    .map_err(|e| format!("保存配置失败: {}", e))
 }
 
+/// Helper kept for generating ids from the frontend when creating workspaces.
 #[tauri::command]
-pub fn save_projects(app_handle: AppHandle, projects: Vec<Project>) -> bool {
-  let store = match open_config_store(&app_handle) {
-    Some(s) => s,
-    None => return false,
-  };
-  store.set("projects".to_string(), json!(projects));
-  store.save().is_ok()
-}
-
-#[tauri::command]
-pub fn load_projects(app_handle: AppHandle) -> Vec<Project> {
-  let store = match open_config_store(&app_handle) {
-    Some(s) => s,
-    None => return Vec::new(),
-  };
-  store
-    .get("projects")
-    .and_then(|v| serde_json::from_value(v.clone()).ok())
-    .unwrap_or_default()
+pub fn create_workspace_id() -> String {
+  new_workspace_id()
 }

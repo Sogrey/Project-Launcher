@@ -1,3 +1,6 @@
+// Hide the console window on Windows release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use tauri::{
   menu::{Menu, MenuItem},
   tray::TrayIconBuilder,
@@ -15,12 +18,12 @@ fn main() {
       commands::scan_project,
       commands::scan_directory,
       commands::start_project,
+      commands::install_project,
       commands::stop_project,
       commands::stop_all_projects,
-      commands::get_workspace_path,
-      commands::set_workspace_path,
-      commands::save_projects,
-      commands::load_projects,
+      commands::load_app_config,
+      commands::save_app_config,
+      commands::create_workspace_id,
     ])
     .setup(|app| {
       let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
