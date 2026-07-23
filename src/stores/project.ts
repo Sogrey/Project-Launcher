@@ -28,6 +28,8 @@ export interface RunningRun {
   project: Project
   script: string
   packageManager: PackageManager
+  /** Bumped on each start; used to ignore stale stop events after restart. */
+  epoch: number
 }
 
 export interface ErroredRun {
@@ -60,6 +62,10 @@ export const useProjectStore = defineStore('project', () => {
   const runLogs = ref<Map<string, string[]>>(new Map())
   const runPorts = ref<Map<string, string[]>>(new Map())
   const erroredRuns = ref<Map<string, ErroredRun>>(new Map())
+  /** Last start epoch per runId (monotonic). */
+  const runEpochs = ref<Map<string, number>>(new Map())
+  /** Epoch that a pending stop intends to clear; stale events are ignored. */
+  const pendingStopEpoch = ref<Map<string, number>>(new Map())
   const selectedProjectPath = ref<string | null>(null)
   /** When set, detail drawer is for a single running script. */
   const selectedRunId = ref<string | null>(null)
@@ -104,6 +110,22 @@ export const useProjectStore = defineStore('project', () => {
   const selectedRun = computed(() =>
     selectedRunId.value ? runningRuns.value.get(selectedRunId.value) || null : null
   )
+
+  function nextEpoch(runId: string): number {
+    const epoch = (runEpochs.value.get(runId) || 0) + 1
+    runEpochs.value.set(runId, epoch)
+    return epoch
+  }
+
+  function clearRunRuntime(runId: string) {
+    runningRuns.value.delete(runId)
+    runPorts.value.delete(runId)
+    runLogs.value.delete(runId)
+    pendingStopEpoch.value.delete(runId)
+    if (selectedRunId.value === runId) {
+      clearSelection()
+    }
+  }
 
   function pathToProjectId(path: string): string {
     return path.replace(/[^\p{L}\p{N}]/gu, '_')
@@ -262,6 +284,10 @@ export const useProjectStore = defineStore('project', () => {
     selectedProjectPath.value = null
     selectedRunId.value = null
     erroredRuns.value.clear()
+    runLogs.value.clear()
+    runPorts.value.clear()
+    runEpochs.value.clear()
+    pendingStopEpoch.value.clear()
     await persistConfig()
   }
 
@@ -302,6 +328,10 @@ export const useProjectStore = defineStore('project', () => {
       selectedProjectPath.value = null
       selectedRunId.value = null
       erroredRuns.value.clear()
+      runLogs.value.clear()
+      runPorts.value.clear()
+      runEpochs.value.clear()
+      pendingStopEpoch.value.clear()
     }
 
     await persistConfig()
@@ -387,21 +417,20 @@ export const useProjectStore = defineStore('project', () => {
       if (result.success) {
         erroredRuns.value.delete(runId)
         const id = result.project_id || runId
+        const epoch = nextEpoch(id)
         runningRuns.value.set(id, {
           runId: id,
           project,
           script,
           packageManager: packageManager.value,
+          epoch,
         })
-        if (!runLogs.value.has(id)) {
-          runLogs.value.set(id, [])
-        }
+        runLogs.value.set(id, [])
         todayStartCount.value += 1
       }
 
       return result
     } catch (err) {
-      runningRuns.value.delete(runId)
       toastError(`启动失败: ${errorMessage(err)}`)
       return { success: false, message: errorMessage(err), project_id: '' }
     }
@@ -418,20 +447,19 @@ export const useProjectStore = defineStore('project', () => {
       if (result.success) {
         erroredRuns.value.delete(runId)
         const id = result.project_id || runId
+        const epoch = nextEpoch(id)
         runningRuns.value.set(id, {
           runId: id,
           project,
           script: 'install',
           packageManager: packageManager.value,
+          epoch,
         })
-        if (!runLogs.value.has(id)) {
-          runLogs.value.set(id, [])
-        }
+        runLogs.value.set(id, [])
       }
 
       return result
     } catch (err) {
-      runningRuns.value.delete(runId)
       toastError(`安装失败: ${errorMessage(err)}`)
       return { success: false, message: errorMessage(err), project_id: '' }
     }
@@ -439,19 +467,23 @@ export const useProjectStore = defineStore('project', () => {
 
   async function stopProject(project: Project, script: string) {
     const runId = runIdFor(project.path, script)
+    const run = runningRuns.value.get(runId)
+    if (run) {
+      pendingStopEpoch.value.set(runId, run.epoch)
+    }
+
     try {
       await invoke('stop_project', { path: project.path, script })
-      runningRuns.value.delete(runId)
-      runPorts.value.delete(runId)
-      if (selectedRunId.value === runId) {
-        clearSelection()
+      const current = runningRuns.value.get(runId)
+      const pending = pendingStopEpoch.value.get(runId)
+      // Keep newer instance if restart already started after this stop.
+      if (current && pending !== undefined && current.epoch !== pending) {
+        return
       }
+      clearRunRuntime(runId)
     } catch (err) {
-      runningRuns.value.delete(runId)
-      runPorts.value.delete(runId)
-      if (selectedRunId.value === runId) {
-        clearSelection()
-      }
+      // Keep frontend running state so user can retry stop (#6).
+      pendingStopEpoch.value.delete(runId)
       toastError(`停止失败: ${errorMessage(err)}`)
       throw err
     }
@@ -473,10 +505,15 @@ export const useProjectStore = defineStore('project', () => {
       await invoke('stop_all_projects')
       runningRuns.value.clear()
       runPorts.value.clear()
+      runLogs.value.clear()
+      pendingStopEpoch.value.clear()
       if (selectedRunId.value) clearSelection()
     } catch (err) {
+      // Best-effort clear; backend may have partially stopped.
       runningRuns.value.clear()
       runPorts.value.clear()
+      runLogs.value.clear()
+      pendingStopEpoch.value.clear()
       if (selectedRunId.value) clearSelection()
       toastError(`一键全停失败: ${errorMessage(err)}`)
       throw err
@@ -484,26 +521,44 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   function markStopped(runId: string) {
-    runningRuns.value.delete(runId)
-    runPorts.value.delete(runId)
-    if (selectedRunId.value === runId) {
-      clearSelection()
+    const run = runningRuns.value.get(runId)
+    const pending = pendingStopEpoch.value.get(runId)
+    if (run && pending !== undefined && run.epoch !== pending) {
+      // Stale stop event from a previous instance (e.g. after restart).
+      pendingStopEpoch.value.delete(runId)
+      return
     }
+    if (run && pending === undefined) {
+      // stop_all / external: clear only if no newer start race — treat as clear.
+    }
+    clearRunRuntime(runId)
   }
 
   function markExited(runId: string, success: boolean) {
     const run = runningRuns.value.get(runId)
-    runningRuns.value.delete(runId)
-    runPorts.value.delete(runId)
-    if (selectedRunId.value === runId) {
-      clearSelection()
+    const pending = pendingStopEpoch.value.get(runId)
+    if (run && pending !== undefined && run.epoch !== pending) {
+      pendingStopEpoch.value.delete(runId)
+      return
     }
 
-    if (!success && run) {
+    // Natural exit of current instance (or stop without pending epoch).
+    if (run && pending === undefined) {
+      // Could be exit of older instance after restart: epoch already bumped.
+      // Without backend epoch we only clear if this is still the tracked run —
+      // which it is if restart bumped epoch and replaced the map entry.
+      // Stale exit for old process: old process was removed from backend map on
+      // kill, so exit usually isn't emitted. Safe to clear current.
+    }
+
+    const exitedRun = run
+    clearRunRuntime(runId)
+
+    if (!success && exitedRun) {
       erroredRuns.value.set(runId, {
         runId,
-        project: run.project,
-        script: run.script,
+        project: exitedRun.project,
+        script: exitedRun.script,
       })
     } else {
       erroredRuns.value.delete(runId)

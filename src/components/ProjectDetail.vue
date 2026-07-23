@@ -155,7 +155,23 @@ async function handleStopCurrentRun() {
   }
 }
 
+async function handleStopAllScripts() {
+  try {
+    await store.stopAllScriptsForProject(props.project)
+    toastSuccess('已停止全部脚本')
+  } catch (e) {
+    toastError(e instanceof Error ? e.message : '停止失败')
+  }
+}
+
 async function handleRemove() {
+  if (
+    !window.confirm(
+      `确定从工作区移除「${props.project.name}」？\n不会删除磁盘上的文件；若有脚本在运行会先全部停止。`
+    )
+  ) {
+    return
+  }
   try {
     await store.removeProject(props.project)
     toastSuccess('项目已删除')
@@ -178,6 +194,13 @@ async function handleRemove() {
           <div class="project-title-block">
             <div class="title-row">
               <h2 class="project-name">{{ project.name }}</h2>
+              <button
+                v-if="!isRunMode && isAnyRunning"
+                class="action-btn stop header-stop-all"
+                @click="handleStopAllScripts"
+              >
+                停止全部
+              </button>
               <button
                 v-if="!isRunMode"
                 class="action-btn danger header-remove"

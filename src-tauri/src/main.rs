@@ -34,7 +34,7 @@ fn main() {
       
       let _tray = TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-          tauri::image::Image::new_owned(vec![66, 126, 234, 255].repeat(32 * 32), 32, 32)
+          tauri::image::Image::new_owned([66, 126, 234, 255].repeat(32 * 32), 32, 32)
         }))
         .menu(&menu)
         .show_menu_on_left_click(true)

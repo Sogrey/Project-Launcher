@@ -19,6 +19,7 @@ const terminalContainer = ref<HTMLElement | null>(null)
 let terminal: Terminal | null = null
 let fitAddon: FitAddon | null = null
 let writtenCount = 0
+let resizeObserver: ResizeObserver | null = null
 const autoScroll = ref(true)
 
 onMounted(() => {
@@ -46,10 +47,17 @@ onMounted(() => {
       terminal?.write(log)
     })
     writtenCount = props.logs.length
+
+    resizeObserver = new ResizeObserver(() => {
+      fitAddon?.fit()
+    })
+    resizeObserver.observe(terminalContainer.value)
   }
 })
 
 onUnmounted(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
   terminal?.dispose()
   terminal = null
   fitAddon = null

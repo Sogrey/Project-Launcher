@@ -317,6 +317,17 @@ fn begin_tracked_process(
 
   {
     let mut processes = lock_processes();
+    if processes.contains_key(&project_id) {
+      kill_process_tree(&mut child);
+      return Err("该脚本已在运行中".to_string());
+    }
+    if processes.len() >= MAX_RUNNING_PROCESSES {
+      kill_process_tree(&mut child);
+      return Err(format!(
+        "同时运行进程数不能超过 {}",
+        MAX_RUNNING_PROCESSES
+      ));
+    }
     processes.insert(project_id.clone(), child);
   }
 
@@ -411,24 +422,6 @@ pub fn start_project(
     };
   }
 
-  {
-    let processes = lock_processes();
-    if processes.len() >= MAX_RUNNING_PROCESSES {
-      return StartResult {
-        success: false,
-        message: format!("同时运行进程数不能超过 {}", MAX_RUNNING_PROCESSES),
-        project_id,
-      };
-    }
-    if processes.contains_key(&project_id) {
-      return StartResult {
-        success: false,
-        message: format!("脚本 {} 已在运行中", script),
-        project_id,
-      };
-    }
-  }
-
   let program = pm_program(&package_manager);
   let mut cmd = Command::new(program);
   match package_manager.as_str() {
@@ -506,24 +499,6 @@ pub fn install_project(
       message: "不支持的包管理器".to_string(),
       project_id,
     };
-  }
-
-  {
-    let processes = lock_processes();
-    if processes.len() >= MAX_RUNNING_PROCESSES {
-      return StartResult {
-        success: false,
-        message: format!("同时运行进程数不能超过 {}", MAX_RUNNING_PROCESSES),
-        project_id,
-      };
-    }
-    if processes.contains_key(&project_id) {
-      return StartResult {
-        success: false,
-        message: "依赖安装已在进行中".to_string(),
-        project_id,
-      };
-    }
   }
 
   let program = pm_program(&package_manager);

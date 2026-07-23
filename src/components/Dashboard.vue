@@ -126,7 +126,23 @@ async function handleStopProject(project: Project, script: string) {
   }
 }
 
+async function handleStopAllScripts(project: Project) {
+  try {
+    await store.stopAllScriptsForProject(project)
+    toastSuccess(`已停止 ${project.name} 的全部脚本`)
+  } catch {
+    // store already shows error
+  }
+}
+
 async function handleRemoveProject(project: Project) {
+  if (
+    !window.confirm(
+      `确定从工作区移除「${project.name}」？\n不会删除磁盘上的文件；若有脚本在运行会先全部停止。`
+    )
+  ) {
+    return
+  }
   try {
     await store.removeProject(project)
     toastSuccess(`已删除 ${project.name}`)
@@ -209,6 +225,14 @@ function handleClearError(runId: string) {
                 :class="store.hasRunningScripts(project.path) ? 'running' : 'stopped'"
               ></span>
               <h3 class="project-name">{{ project.name }}</h3>
+              <button
+                v-if="store.hasRunningScripts(project.path)"
+                class="tile-stop-all"
+                title="停止该项目全部脚本"
+                @click.stop="handleStopAllScripts(project)"
+              >
+                ■■
+              </button>
               <button
                 class="tile-delete"
                 title="从工作区移除"
@@ -693,6 +717,24 @@ function handleClearError(runId: string) {
 
 .tile-stop:hover {
   background: rgba(239, 68, 68, 0.3);
+}
+
+.tile-stop-all {
+  width: 28px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  font-size: 9px;
+  letter-spacing: -1px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.tile-stop-all:hover {
+  background: rgba(239, 68, 68, 0.28);
 }
 
 .status-dot {
