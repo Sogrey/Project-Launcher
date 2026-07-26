@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { open as openUrl } from '@tauri-apps/plugin-shell'
 import { useProjectStore, type Project } from '@/stores/project'
 import ProjectDetail from './ProjectDetail.vue'
+import LogPanel from './LogPanel.vue'
 import { toastSuccess, toastError } from '@/utils/toast'
 
 const store = useProjectStore()
@@ -11,6 +12,29 @@ const showWorkspacePanel = ref(false)
 const newWorkspaceName = ref('')
 const renamingId = ref<string | null>(null)
 const renameValue = ref('')
+
+const focusedRun = computed(() =>
+  store.selectedRunId ? store.runningRuns.get(store.selectedRunId) || null : null
+)
+
+const focusedLogs = computed(() =>
+  store.selectedRunId ? store.logsForRun(store.selectedRunId) : []
+)
+
+const focusedLogLabel = computed(() => {
+  if (!focusedRun.value) return ''
+  return `${focusedRun.value.project.name} / ${focusedRun.value.script}`
+})
+
+// If focused run disappears from running list, clear focus.
+watch(
+  () => store.runningRunList.map((r) => r.runId),
+  (ids) => {
+    if (store.selectedRunId && !ids.includes(store.selectedRunId)) {
+      store.selectRun(null)
+    }
+  }
+)
 
 async function handleAddProject() {
   try {
@@ -95,8 +119,13 @@ function handleRunClick(runId: string) {
   store.selectRun(runId)
 }
 
+/** Close project drawer only — log focus stays on the selected running task. */
 function handleCloseDetail() {
-  store.clearSelection()
+  store.selectProject(null)
+}
+
+function clearLogFocus() {
+  store.selectRun(null)
 }
 
 function getRunPorts(runId: string) {
@@ -158,10 +187,15 @@ function handleClearError(runId: string) {
 
 <template>
   <div class="dashboard-container">
+    <div class="scanlines" aria-hidden="true"></div>
+
     <header class="header">
       <div class="header-left">
-        <h1 class="title">Project Launcher</h1>
-        <p class="subtitle">工作区: {{ store.activeWorkspaceName }}</p>
+        <div class="brand-row">
+          <span class="brand-mark"></span>
+          <h1 class="title">Project Launcher</h1>
+        </div>
+        <p class="subtitle">工作区 // {{ store.activeWorkspaceName }}</p>
       </div>
       <div class="header-right">
         <div class="stats">
@@ -191,7 +225,8 @@ function handleClearError(runId: string) {
     </header>
 
     <main class="board">
-      <section class="column stopped">
+      <!-- 左：项目列表 -->
+      <section class="column projects">
         <div class="column-header">
           <span class="column-dot stopped"></span>
           <h2>项目列表</h2>
@@ -213,8 +248,7 @@ function handleClearError(runId: string) {
             :key="project.path"
             class="tile project-tile"
             :class="{
-              selected:
-                store.selectedProjectPath === project.path && store.detailMode === 'project',
+              selected: store.selectedProjectPath === project.path,
               running: store.hasRunningScripts(project.path),
             }"
             @click="handleProjectClick(project)"
@@ -257,6 +291,7 @@ function handleClearError(runId: string) {
         </div>
       </section>
 
+      <!-- 中：运行中 -->
       <section class="column running">
         <div class="column-header">
           <span class="column-dot running"></span>
@@ -301,46 +336,73 @@ function handleClearError(runId: string) {
 
           <div v-if="store.runningRunList.length === 0" class="empty-column">
             <p>暂无运行中的脚本</p>
+            <p class="hint">点击左侧项目启动脚本后会出现在这里</p>
           </div>
         </div>
       </section>
 
-      <section class="column errored">
-        <div class="column-header">
-          <span class="column-dot errored"></span>
-          <h2>异常</h2>
-          <span class="column-count">{{ store.erroredRunList.length }}</span>
+      <!-- 右：上日志 / 下异常 -->
+      <section class="column side-panel">
+        <div class="side-logs">
+          <div class="column-header">
+            <span class="column-dot running"></span>
+            <h2>日志输出</h2>
+            <span v-if="focusedLogLabel" class="log-focus-tag" :title="focusedLogLabel">
+              {{ focusedLogLabel }}
+            </span>
+            <button
+              v-if="store.selectedRunId"
+              class="log-clear-focus"
+              title="取消日志焦点"
+              @click="clearLogFocus"
+            >
+              取消
+            </button>
+          </div>
+          <div class="log-body">
+            <LogPanel
+              v-if="store.selectedRunId && focusedRun"
+              :key="store.selectedRunId"
+              :project-path="store.selectedRunId"
+              :logs="focusedLogs"
+              fill
+              @clear="store.clearLogs(store.selectedRunId!)"
+            />
+            <div v-else class="empty-column log-empty">
+              <p>选择中间列正在运行的任务</p>
+              <p class="hint">以查看对应实时日志</p>
+            </div>
+          </div>
         </div>
-        <div class="column-body">
-          <div
-            v-for="run in store.erroredRunList"
-            :key="run.runId"
-            class="tile project-tile errored"
-            :class="{ selected: store.selectedProjectPath === run.project.path }"
-            @click="handleProjectClick(run.project)"
-          >
-            <div class="tile-header">
-              <span class="status-dot errored"></span>
-              <h3 class="project-name">{{ run.project.name }}</h3>
+
+        <div class="side-errors">
+          <div class="column-header compact">
+            <span class="column-dot errored"></span>
+            <h2>异常</h2>
+            <span class="column-count">{{ store.erroredRunList.length }}</span>
+          </div>
+          <div class="error-body">
+            <div
+              v-for="run in store.erroredRunList"
+              :key="run.runId"
+              class="error-row"
+              @click="handleProjectClick(run.project)"
+            >
+              <div class="error-main">
+                <span class="error-name">{{ run.project.name }}</span>
+                <span class="error-script">{{ run.script }}</span>
+              </div>
               <button
-                class="tile-delete"
+                class="dismiss-btn"
                 title="清除记录"
                 @click.stop="handleClearError(run.runId)"
               >
-                ×
-              </button>
-            </div>
-            <p class="project-path">{{ run.project.path }}</p>
-            <div class="errored-info">
-              <span class="error-text">{{ run.script }} 异常退出</span>
-              <button class="dismiss-btn" @click.stop="handleClearError(run.runId)">
                 清除
               </button>
             </div>
-          </div>
-
-          <div v-if="store.erroredRunList.length === 0" class="empty-column">
-            <p>暂无异常记录</p>
+            <div v-if="store.erroredRunList.length === 0" class="empty-errors">
+              暂无异常记录
+            </div>
           </div>
         </div>
       </section>
@@ -349,8 +411,6 @@ function handleClearError(runId: string) {
     <ProjectDetail
       v-if="store.selectedProject"
       :project="store.selectedProject"
-      :mode="store.detailMode"
-      :run-id="store.selectedRunId"
       @close="handleCloseDetail"
     />
 
@@ -426,23 +486,49 @@ function handleClearError(runId: string) {
 
 <style scoped>
 .dashboard-container {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
-  padding: 20px;
-  gap: 20px;
+  padding: 16px 18px;
+  gap: 14px;
+  overflow: hidden;
+}
+
+.scanlines {
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.06) 2px,
+    rgba(0, 0, 0, 0.06) 4px
+  );
+  opacity: 0.35;
+}
+
+.header,
+.board {
+  position: relative;
+  z-index: 1;
 }
 
 .header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 20px 30px;
-  background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(20px);
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  gap: 20px;
+  padding: 14px 20px;
+  background: rgba(8, 14, 26, 0.78);
+  backdrop-filter: blur(16px);
+  border-radius: 12px;
+  border: 1px solid var(--border-glow);
+  box-shadow:
+    0 0 0 1px rgba(56, 189, 248, 0.04) inset,
+    0 8px 32px rgba(0, 0, 0, 0.35);
+  gap: 16px;
   flex-wrap: wrap;
 }
 
@@ -453,227 +539,392 @@ function handleClearError(runId: string) {
   min-width: 0;
 }
 
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-mark {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--accent-cyan);
+  box-shadow: 0 0 12px var(--accent-cyan);
+  animation: pulse-mark 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse-mark {
+  0%, 100% { opacity: 1; box-shadow: 0 0 10px var(--accent-cyan); }
+  50% { opacity: 0.65; box-shadow: 0 0 18px var(--accent-cyan); }
+}
+
 .title {
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 700;
-  color: #fff;
+  letter-spacing: 0.04em;
+  color: var(--text-primary);
   margin: 0;
+  text-transform: uppercase;
 }
 
 .subtitle {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.5);
+  font-size: 12px;
+  color: var(--text-muted);
   margin: 0;
   max-width: 420px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  letter-spacing: 0.02em;
 }
 
 .header-right {
   display: flex;
   align-items: center;
-  gap: 24px;
+  gap: 20px;
   flex-wrap: wrap;
 }
 
 .stats {
   display: flex;
-  gap: 24px;
+  gap: 18px;
 }
 
 .stat-item {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
+  min-width: 52px;
 }
 
 .stat-value {
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 700;
-  color: #fff;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
 }
 
 .stat-item.running .stat-value {
-  color: #4ade80;
+  color: var(--accent-mint);
+  text-shadow: 0 0 12px rgba(52, 211, 153, 0.45);
 }
 
 .stat-item.errored .stat-value {
-  color: #f87171;
+  color: var(--accent-rose);
+  text-shadow: 0 0 12px rgba(251, 113, 133, 0.4);
 }
 
 .stat-label {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .actions {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
 .btn {
-  padding: 10px 16px;
-  border-radius: 8px;
-  font-size: 14px;
-  font-weight: 500;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   cursor: pointer;
   border: none;
   transition: all 0.2s;
+  font-family: inherit;
 }
 
 .btn-secondary {
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  background: rgba(56, 189, 248, 0.12);
+  color: var(--accent-cyan);
+  border: 1px solid rgba(56, 189, 248, 0.35);
 }
 
 .btn-secondary:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(56, 189, 248, 0.22);
+  box-shadow: 0 0 16px rgba(56, 189, 248, 0.2);
 }
 
 .btn-danger {
-  background: #ef4444;
-  color: #fff;
+  background: rgba(251, 113, 133, 0.15);
+  color: var(--accent-rose);
+  border: 1px solid rgba(251, 113, 133, 0.4);
 }
 
 .btn-danger:hover {
-  background: #dc2626;
+  background: rgba(251, 113, 133, 0.28);
+  box-shadow: 0 0 16px rgba(251, 113, 133, 0.25);
 }
 
 .btn-outline {
   background: transparent;
-  color: rgba(255, 255, 255, 0.8);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: var(--text-muted);
+  border: 1px solid rgba(186, 210, 240, 0.2);
 }
 
 .btn-outline:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
 }
 
 .board {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
+  grid-template-columns: minmax(240px, 1fr) minmax(240px, 1fr) minmax(320px, 1.35fr);
+  gap: 12px;
 }
 
 .column {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-glow);
+  border-radius: 12px;
   overflow: hidden;
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.03) inset;
 }
 
 .column-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 14px 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(56, 189, 248, 0.12);
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.08), transparent 70%);
+}
+
+.column-header.compact {
+  padding: 8px 12px;
 }
 
 .column-header h2 {
   margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
   flex: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 .column-count {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.45);
-  background: rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  padding: 1px 8px;
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-focus-tag {
+  font-size: 11px;
+  color: var(--accent-mint);
+  background: rgba(52, 211, 153, 0.1);
+  border: 1px solid rgba(52, 211, 153, 0.3);
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: 4px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-clear-focus {
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  background: rgba(56, 189, 248, 0.08);
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+
+.log-clear-focus:hover {
+  color: var(--accent-cyan);
+  border-color: rgba(56, 189, 248, 0.45);
 }
 
 .column-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  flex-shrink: 0;
 }
 
 .column-dot.stopped {
-  background: #9ca3af;
+  background: #64748b;
 }
 
 .column-dot.running {
-  background: #4ade80;
+  background: var(--accent-mint);
+  box-shadow: 0 0 8px var(--accent-mint);
 }
 
 .column-dot.errored {
-  background: #f87171;
+  background: var(--accent-rose);
+  box-shadow: 0 0 8px var(--accent-rose);
 }
 
 .column-body {
   flex: 1;
   overflow-y: auto;
-  padding: 12px;
+  padding: 10px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
+}
+
+/* 右侧分栏 */
+.side-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.side-logs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid rgba(56, 189, 248, 0.14);
+}
+
+.log-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+}
+
+.side-errors {
+  flex: 0 0 28%;
+  max-height: 32%;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(251, 113, 133, 0.03);
+}
+
+.error-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.error-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(251, 113, 133, 0.25);
+  background: rgba(251, 113, 133, 0.06);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.error-row:hover {
+  background: rgba(251, 113, 133, 0.12);
+}
+
+.error-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.error-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error-script {
+  font-size: 11px;
+  color: var(--accent-rose);
+}
+
+.empty-errors {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .tile {
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  padding: 16px;
+  background: rgba(12, 22, 40, 0.65);
+  border-radius: 8px;
+  border: 1px solid rgba(56, 189, 248, 0.14);
+  padding: 12px 14px;
   cursor: pointer;
-  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: all 0.2s ease;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .tile:hover {
-  border-color: rgba(255, 255, 255, 0.2);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  border-color: rgba(56, 189, 248, 0.4);
+  box-shadow: 0 0 20px rgba(56, 189, 248, 0.08);
+  transform: translateY(-1px);
 }
 
 .add-tile {
-  background: linear-gradient(135deg, rgba(102, 126, 234, 0.2) 0%, rgba(118, 75, 162, 0.2) 100%);
-  border-color: rgba(102, 126, 234, 0.3);
+  background: rgba(56, 189, 248, 0.06);
+  border-style: dashed;
+  border-color: rgba(56, 189, 248, 0.35);
   align-items: center;
   justify-content: center;
-  min-height: 96px;
+  min-height: 84px;
 }
 
 .add-tile:hover {
-  background: linear-gradient(135deg, rgba(102, 126, 234, 0.3) 0%, rgba(118, 75, 162, 0.3) 100%);
+  background: rgba(56, 189, 248, 0.12);
 }
 
 .add-icon {
-  color: #667eea;
+  color: var(--accent-cyan);
 }
 
 .add-text {
-  color: rgba(255, 255, 255, 0.7);
-  font-size: 13px;
-  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
 }
 
 .project-tile.selected {
-  border-color: #667eea;
-  background: rgba(102, 126, 234, 0.1);
+  border-color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.1);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2), 0 0 24px rgba(56, 189, 248, 0.12);
 }
 
 .project-tile.running {
-  border-color: rgba(74, 222, 128, 0.4);
-  background: rgba(74, 222, 128, 0.05);
-}
-
-.project-tile.errored {
-  border-color: rgba(248, 113, 113, 0.45);
-  background: rgba(248, 113, 113, 0.06);
+  border-color: rgba(52, 211, 153, 0.35);
 }
 
 .tile-header {
@@ -687,18 +938,18 @@ function handleClearError(runId: string) {
   width: 24px;
   height: 24px;
   border: none;
-  border-radius: 6px;
+  border-radius: 4px;
   background: transparent;
-  color: rgba(255, 255, 255, 0.35);
-  font-size: 18px;
+  color: var(--text-muted);
+  font-size: 16px;
   line-height: 1;
   cursor: pointer;
   flex-shrink: 0;
 }
 
 .tile-delete:hover {
-  background: rgba(239, 68, 68, 0.2);
-  color: #f87171;
+  background: rgba(251, 113, 133, 0.2);
+  color: var(--accent-rose);
 }
 
 .tile-stop {
@@ -706,9 +957,9 @@ function handleClearError(runId: string) {
   width: 24px;
   height: 24px;
   border: none;
-  border-radius: 6px;
-  background: rgba(239, 68, 68, 0.15);
-  color: #f87171;
+  border-radius: 4px;
+  background: rgba(251, 113, 133, 0.12);
+  color: var(--accent-rose);
   font-size: 10px;
   line-height: 1;
   cursor: pointer;
@@ -716,16 +967,16 @@ function handleClearError(runId: string) {
 }
 
 .tile-stop:hover {
-  background: rgba(239, 68, 68, 0.3);
+  background: rgba(251, 113, 133, 0.28);
 }
 
 .tile-stop-all {
   width: 28px;
   height: 24px;
   border: none;
-  border-radius: 6px;
-  background: rgba(239, 68, 68, 0.12);
-  color: #f87171;
+  border-radius: 4px;
+  background: rgba(251, 113, 133, 0.1);
+  color: var(--accent-rose);
   font-size: 9px;
   letter-spacing: -1px;
   line-height: 1;
@@ -734,38 +985,35 @@ function handleClearError(runId: string) {
 }
 
 .tile-stop-all:hover {
-  background: rgba(239, 68, 68, 0.28);
+  background: rgba(251, 113, 133, 0.25);
 }
 
 .status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
   flex-shrink: 0;
 }
 
 .status-dot.running {
-  background: #4ade80;
+  background: var(--accent-mint);
+  box-shadow: 0 0 8px var(--accent-mint);
   animation: pulse 2s infinite;
 }
 
 .status-dot.stopped {
-  background: #9ca3af;
-}
-
-.status-dot.errored {
-  background: #f87171;
+  background: #64748b;
 }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+  50% { opacity: 0.45; }
 }
 
 .project-name {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
-  color: #fff;
+  color: var(--text-primary);
   margin: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -773,21 +1021,20 @@ function handleClearError(runId: string) {
 }
 
 .project-path {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.4);
+  font-size: 11px;
+  color: var(--text-muted);
   margin: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.running-info,
-.errored-info {
+.running-info {
   margin-top: auto;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
 }
 
 .stopped-info {
@@ -798,68 +1045,55 @@ function handleClearError(runId: string) {
   gap: 4px;
 }
 
-.running-badge {
-  font-size: 12px;
-  color: #4ade80;
-}
-
+.running-badge,
 .current-script {
-  font-size: 12px;
-  color: #4ade80;
+  font-size: 11px;
+  color: var(--accent-mint);
   font-weight: 500;
 }
 
 .ports {
   display: flex;
   gap: 6px;
-  margin-top: 6px;
   flex-wrap: wrap;
 }
 
 .port {
-  background: rgba(74, 222, 128, 0.2);
-  color: #4ade80;
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--accent-mint);
   padding: 2px 8px;
-  border-radius: 12px;
+  border-radius: 4px;
   font-size: 11px;
   font-weight: 500;
   cursor: pointer;
-  border: none;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  font-family: inherit;
 }
 
 .port:hover {
-  background: rgba(74, 222, 128, 0.3);
+  background: rgba(52, 211, 153, 0.22);
   text-decoration: underline;
 }
 
-.waiting-port {
-  margin-top: 6px;
+.script-count {
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.35);
-}
-
-.script-count,
-.error-text {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.45);
-}
-
-.error-text {
-  color: #f87171;
+  color: var(--text-muted);
 }
 
 .dismiss-btn {
-  border: none;
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.7);
-  font-size: 12px;
+  border: 1px solid rgba(251, 113, 133, 0.3);
+  background: rgba(251, 113, 133, 0.1);
+  color: var(--accent-rose);
+  font-size: 11px;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: 4px;
   cursor: pointer;
+  font-family: inherit;
+  flex-shrink: 0;
 }
 
 .dismiss-btn:hover {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(251, 113, 133, 0.22);
 }
 
 .empty-column {
@@ -867,27 +1101,34 @@ function handleClearError(runId: string) {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 32px 12px;
-  color: rgba(255, 255, 255, 0.4);
+  padding: 28px 12px;
+  color: var(--text-muted);
   gap: 4px;
   text-align: center;
+  flex: 1;
 }
 
 .empty-column p {
   margin: 0;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .empty-column .hint {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.28);
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.log-empty {
+  border: 1px dashed rgba(56, 189, 248, 0.2);
+  border-radius: 8px;
+  background: rgba(56, 189, 248, 0.03);
 }
 
 .ws-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(6px);
   z-index: 1200;
   display: flex;
   align-items: center;
@@ -899,13 +1140,14 @@ function handleClearError(runId: string) {
   width: min(520px, 100%);
   max-height: 80vh;
   overflow: auto;
-  background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 16px;
+  background: rgba(8, 14, 26, 0.95);
+  border: 1px solid var(--border-glow);
+  border-radius: 12px;
   padding: 20px;
   display: flex;
   flex-direction: column;
   gap: 16px;
+  box-shadow: 0 0 40px rgba(56, 189, 248, 0.1);
 }
 
 .ws-header {
@@ -916,23 +1158,25 @@ function handleClearError(runId: string) {
 
 .ws-header h2 {
   margin: 0;
-  color: #fff;
-  font-size: 18px;
+  color: var(--text-primary);
+  font-size: 16px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .ws-header .close-btn {
   border: none;
   background: transparent;
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 24px;
+  color: var(--text-muted);
+  font-size: 22px;
   cursor: pointer;
   line-height: 1;
 }
 
 .ws-hint {
   margin: 0;
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.45);
+  font-size: 12px;
+  color: var(--text-muted);
   line-height: 1.5;
 }
 
@@ -945,17 +1189,19 @@ function handleClearError(runId: string) {
 .ws-input {
   flex: 1;
   padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
-  color: #fff;
+  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  background: rgba(56, 189, 248, 0.06);
+  color: var(--text-primary);
   outline: none;
+  font-family: inherit;
+  font-size: 13px;
 }
 
 .ws-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .ws-item {
@@ -963,14 +1209,15 @@ function handleClearError(runId: string) {
   align-items: center;
   gap: 10px;
   padding: 12px;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+  border: 1px solid rgba(56, 189, 248, 0.14);
+  background: rgba(12, 22, 40, 0.6);
 }
 
 .ws-item.active {
-  border-color: rgba(102, 126, 234, 0.5);
-  background: rgba(102, 126, 234, 0.12);
+  border-color: rgba(56, 189, 248, 0.5);
+  background: rgba(56, 189, 248, 0.1);
+  box-shadow: 0 0 16px rgba(56, 189, 248, 0.1);
 }
 
 .ws-meta {
@@ -983,14 +1230,14 @@ function handleClearError(runId: string) {
 }
 
 .ws-name {
-  color: #fff;
+  color: var(--text-primary);
   font-weight: 600;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .ws-count {
-  color: rgba(255, 255, 255, 0.4);
-  font-size: 12px;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .ws-actions {
@@ -1000,22 +1247,25 @@ function handleClearError(runId: string) {
 }
 
 .ws-mini {
-  border: none;
-  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  border-radius: 4px;
   padding: 4px 8px;
-  font-size: 12px;
+  font-size: 11px;
   cursor: pointer;
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.75);
+  background: rgba(56, 189, 248, 0.08);
+  color: var(--text-muted);
+  font-family: inherit;
 }
 
 .ws-mini:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.16);
+  color: var(--accent-cyan);
+  border-color: rgba(56, 189, 248, 0.4);
 }
 
 .ws-mini.danger {
-  color: #f87171;
-  background: rgba(239, 68, 68, 0.15);
+  color: var(--accent-rose);
+  border-color: rgba(251, 113, 133, 0.3);
+  background: rgba(251, 113, 133, 0.08);
 }
 
 .ws-mini:disabled {
@@ -1023,9 +1273,45 @@ function handleClearError(runId: string) {
   cursor: not-allowed;
 }
 
+@media (max-width: 1200px) {
+  .board {
+    grid-template-columns: minmax(200px, 1fr) minmax(200px, 1fr) minmax(280px, 1.2fr);
+  }
+}
+
 @media (max-width: 960px) {
   .board {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(220px, 1fr) minmax(240px, 0.85fr);
+    gap: 10px;
+  }
+
+  .side-panel {
+    grid-column: 1 / -1;
+  }
+
+  .side-errors {
+    flex-basis: 34%;
+    max-height: 40%;
+  }
+}
+
+@media (max-width: 640px) {
+  .dashboard-container {
+    padding: 10px;
+  }
+
+  .board {
     grid-template-columns: 1fr;
+    grid-template-rows: minmax(180px, 0.9fr) minmax(180px, 0.9fr) minmax(260px, 1.1fr);
+  }
+
+  .side-panel {
+    grid-column: auto;
+  }
+
+  .stats {
+    gap: 12px;
   }
 }
 </style>

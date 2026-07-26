@@ -25,12 +25,12 @@ const autoScroll = ref(true)
 onMounted(() => {
   terminal = new Terminal({
     fontSize: 12,
-    fontFamily: 'Consolas, monospace',
+    fontFamily: 'JetBrains Mono, Cascadia Code, Consolas, monospace',
     theme: {
-      background: 'rgba(20, 20, 30, 0.95)',
-      foreground: '#e0e0e0',
-      cursor: '#e0e0e0',
-      selectionBackground: 'rgba(102, 126, 234, 0.4)',
+      background: '#0a121f',
+      foreground: '#c8e0f8',
+      cursor: '#38bdf8',
+      selectionBackground: 'rgba(56, 189, 248, 0.35)',
     },
     cursorBlink: false,
     scrollback: 1000,
@@ -117,9 +117,9 @@ function handleFit() {
 
 <style scoped>
 .log-panel {
-  background: rgba(20, 20, 30, 0.95);
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: #0a121f;
+  border-radius: 8px;
+  border: 1px solid rgba(56, 189, 248, 0.2);
   overflow: hidden;
 }
 
