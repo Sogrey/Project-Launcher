@@ -102,11 +102,6 @@ export const useProjectStore = defineStore('project', () => {
       : null
   )
 
-  /** `project` = script list drawer; `run` = single-script log drawer. */
-  const detailMode = computed<'project' | 'run'>(() =>
-    selectedRunId.value ? 'run' : 'project'
-  )
-
   const selectedRun = computed(() =>
     selectedRunId.value ? runningRuns.value.get(selectedRunId.value) || null : null
   )
@@ -123,12 +118,21 @@ export const useProjectStore = defineStore('project', () => {
     runLogs.value.delete(runId)
     pendingStopEpoch.value.delete(runId)
     if (selectedRunId.value === runId) {
-      clearSelection()
+      selectedRunId.value = null
     }
   }
 
+  /** Must match Rust `project_id_from_path` (non-alnum → `_HEX_`). */
   function pathToProjectId(path: string): string {
-    return path.replace(/[^\p{L}\p{N}]/gu, '_')
+    let out = ''
+    for (const ch of path) {
+      if (/^[\p{L}\p{N}]$/u.test(ch)) {
+        out += ch
+      } else {
+        out += `_${ch.codePointAt(0)!.toString(16).toUpperCase()}_`
+      }
+    }
+    return out
   }
 
   function runIdFor(path: string, script: string): string {
@@ -218,20 +222,25 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  /** Open / close the project management drawer. Does not clear log focus. */
   function selectProject(path: string | null) {
     selectedProjectPath.value = path
-    selectedRunId.value = null
   }
 
+  /** Focus a running script for the right-side log panel (does not open the project drawer). */
   function selectRun(runId: string | null) {
-    if (!runId) {
-      selectedRunId.value = null
-      selectedProjectPath.value = null
-      return
-    }
-    const run = runningRuns.value.get(runId)
     selectedRunId.value = runId
-    selectedProjectPath.value = run?.project.path ?? pathFromRunId(runId) ?? null
+  }
+
+  /**
+   * Auto-focus a newly started run only when the log panel is idle
+   * (no focus, or focused run already gone). Avoids stealing focus during batch starts.
+   */
+  function focusRunIfIdle(runId: string | null) {
+    if (!runId) return
+    const current = selectedRunId.value
+    if (current && runningRuns.value.has(current)) return
+    selectedRunId.value = runId
   }
 
   function clearSelection() {
@@ -615,7 +624,6 @@ export const useProjectStore = defineStore('project', () => {
     selectedRunId,
     selectedProject,
     selectedRun,
-    detailMode,
     packageManager,
     todayStartCount,
     totalProjects,
@@ -633,6 +641,7 @@ export const useProjectStore = defineStore('project', () => {
     removeProject,
     selectProject,
     selectRun,
+    focusRunIfIdle,
     clearSelection,
     startProject,
     installProject,
