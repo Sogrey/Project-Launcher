@@ -78,8 +78,24 @@ fn validate_dir_path(path: &str) -> Result<PathBuf, String> {
   Ok(canonical)
 }
 
+/// Encode path to a stable id. Non-alphanumeric chars become `_HEX_` so that
+/// paths differing only by `-` vs `_` (or other punctuation) never collide.
+///
+/// Breaking change vs early builds that collapsed all non-alnum to `_`.
+/// Run ids are in-memory only (not persisted in app config); restart the app
+/// after upgrading if any external tooling assumed the old format.
 fn project_id_from_path(path: &str) -> String {
-  path.replace(|c: char| !c.is_alphanumeric(), "_")
+  let mut out = String::with_capacity(path.len() * 2);
+  for c in path.chars() {
+    if c.is_alphanumeric() {
+      out.push(c);
+    } else {
+      out.push('_');
+      out.push_str(&format!("{:X}", c as u32));
+      out.push('_');
+    }
+  }
+  out
 }
 
 /// Unique run id so one project can run multiple scripts in parallel.
@@ -315,20 +331,31 @@ fn begin_tracked_process(
     }
   };
 
-  {
+  // Check + insert under one lock; kill rejected orphans only after releasing
+  // the mutex so taskkill / wait cannot block other stop/start commands (R3-01).
+  let mut orphan: Option<Child> = Some(child);
+  let rejected: Option<String> = {
     let mut processes = lock_processes();
     if processes.contains_key(&project_id) {
-      kill_process_tree(&mut child);
-      return Err("该脚本已在运行中".to_string());
-    }
-    if processes.len() >= MAX_RUNNING_PROCESSES {
-      kill_process_tree(&mut child);
-      return Err(format!(
+      Some("该脚本已在运行中".to_string())
+    } else if processes.len() >= MAX_RUNNING_PROCESSES {
+      Some(format!(
         "同时运行进程数不能超过 {}",
         MAX_RUNNING_PROCESSES
-      ));
+      ))
+    } else if let Some(admitted) = orphan.take() {
+      processes.insert(project_id.clone(), admitted);
+      None
+    } else {
+      Some("内部错误：进程句柄丢失".to_string())
     }
-    processes.insert(project_id.clone(), child);
+  };
+
+  if let Some(message) = rejected {
+    if let Some(mut child) = orphan {
+      kill_process_tree(&mut child);
+    }
+    return Err(message);
   }
 
   let readers_done = Arc::new(AtomicUsize::new(0));
