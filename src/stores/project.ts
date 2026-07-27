@@ -22,6 +22,37 @@ export interface AppConfig {
 
 export type PackageManager = 'npm' | 'pnpm' | 'yarn'
 
+/** Match Rust `is_listed_script_name` in commands.rs — keep rules in sync. */
+const RUNNABLE_SCRIPT_RE = /^[a-zA-Z0-9_:-]+$/
+
+/** Mirrors Rust `is_listed_script_name` in `commands.rs` — keep in sync. */
+export function isListedScriptName(name: string): boolean {
+  const trimmed = name.trimStart()
+  if (!trimmed) return false
+  if (
+    trimmed.startsWith('//') ||
+    trimmed.startsWith('#') ||
+    trimmed.startsWith('@') ||
+    trimmed.startsWith('/*') ||
+    trimmed.startsWith('*') ||
+    trimmed.startsWith('!') ||
+    trimmed.startsWith('?') ||
+    trimmed.startsWith(';')
+  ) {
+    return false
+  }
+  const first = trimmed[0]
+  if (!/[a-zA-Z0-9_]/.test(first)) return false
+  return RUNNABLE_SCRIPT_RE.test(name.trim())
+}
+
+export function sanitizeProjectScripts(project: Project): Project {
+  return {
+    ...project,
+    scripts: project.scripts.filter(([name]) => isListedScriptName(name)),
+  }
+}
+
 /** One running script instance (a project may have several). */
 export interface RunningRun {
   runId: string
@@ -169,7 +200,20 @@ export const useProjectStore = defineStore('project', () => {
 
   function syncActiveProjectsFromWorkspaces() {
     const ws = workspaces.value.find((w) => w.id === activeWorkspaceId.value)
-    projects.value = ws ? [...ws.projects] : []
+    projects.value = ws ? ws.projects.map(sanitizeProjectScripts) : []
+  }
+
+  function sanitizeAllWorkspaces(): number {
+    let removed = 0
+    workspaces.value = workspaces.value.map((w) => ({
+      ...w,
+      projects: w.projects.map((p) => {
+        const next = sanitizeProjectScripts(p)
+        removed += p.scripts.length - next.scripts.length
+        return next
+      }),
+    }))
+    return removed
   }
 
   function writeProjectsToActiveWorkspace() {
@@ -177,12 +221,14 @@ export const useProjectStore = defineStore('project', () => {
     if (idx < 0) return
     workspaces.value[idx] = {
       ...workspaces.value[idx],
-      projects: [...projects.value],
+      projects: projects.value.map(sanitizeProjectScripts),
     }
   }
 
   async function persistConfig() {
+    // Active workspace is sanitized on write; other workspaces were cleaned on load.
     writeProjectsToActiveWorkspace()
+    syncActiveProjectsFromWorkspaces()
     const config: AppConfig = {
       activeWorkspaceId: activeWorkspaceId.value,
       workspaces: workspaces.value.map((w) => ({
@@ -205,6 +251,7 @@ export const useProjectStore = defineStore('project', () => {
       const normalized = config?.workspaces?.length > 0 ? config : defaultConfig()
 
       workspaces.value = normalized.workspaces
+      const removed = sanitizeAllWorkspaces()
       activeWorkspaceId.value = normalized.workspaces.some(
         (w) => w.id === normalized.activeWorkspaceId
       )
@@ -212,6 +259,11 @@ export const useProjectStore = defineStore('project', () => {
         : normalized.workspaces[0].id
       syncActiveProjectsFromWorkspaces()
       initialized.value = true
+      // One-shot migration: drop fake comment keys then save (persistConfig won't recurse).
+      if (removed > 0) {
+        toastWarning(`已过滤 ${removed} 个注释类脚本（//、#、@ 等），配置已更新`)
+        await persistConfig()
+      }
     } catch (err) {
       const fallback = defaultConfig()
       workspaces.value = fallback.workspaces
@@ -354,10 +406,11 @@ export const useProjectStore = defineStore('project', () => {
         return
       }
       const existingIndex = projects.value.findIndex((p) => p.path === result.path)
+      const sanitized = sanitizeProjectScripts(result)
       if (existingIndex >= 0) {
-        projects.value[existingIndex] = result
+        projects.value[existingIndex] = sanitized
       } else {
-        projects.value.push(result)
+        projects.value.push(sanitized)
       }
       await persistConfig()
     } catch (err) {
@@ -371,7 +424,7 @@ export const useProjectStore = defineStore('project', () => {
       const scanned = await invoke<Project[]>('scan_directory', { path })
       const byPath = new Map(projects.value.map((p) => [p.path, p]))
       for (const project of scanned) {
-        byPath.set(project.path, project)
+        byPath.set(project.path, sanitizeProjectScripts(project))
       }
       projects.value = Array.from(byPath.values())
       await persistConfig()
@@ -416,6 +469,10 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function startProject(project: Project, script: string) {
+    if (!isListedScriptName(script)) {
+      toastWarning('非法脚本名（注释/元数据类脚本不可运行）')
+      return { success: false, message: '非法脚本名', project_id: '' }
+    }
     const runId = runIdFor(project.path, script)
     try {
       const result = await invoke<{ success: boolean; message: string; project_id: string }>(

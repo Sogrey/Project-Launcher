@@ -115,6 +115,43 @@ fn is_valid_script(script: &str) -> bool {
   !script.is_empty() && SCRIPT_RE.is_match(script)
 }
 
+/// Detect package.json "fake comment" / metadata script keys.
+///
+/// - Short-circuit vs `SCRIPT_RE` (redundant but explicit): prefixes like `//`, `#`, `@`,
+///   `/*`, `*`, `!`, `?`, `;` are already rejected by `^[a-zA-Z0-9_:-]+$`.
+/// - Necessary beyond the regex: reject names that match the regex but start with `-` or `:`
+///   (allowed by charset, not treated as runnable listing names).
+fn is_pseudo_comment_script_key(name: &str) -> bool {
+  let trimmed = name.trim_start();
+  if trimmed.is_empty() {
+    return true;
+  }
+  // Explicit comment / metadata prefixes used in the wild (also rejected by SCRIPT_RE).
+  if trimmed.starts_with("//")
+    || trimmed.starts_with('#')
+    || trimmed.starts_with('@')
+    || trimmed.starts_with("/*")
+    || trimmed.starts_with('*')
+    || trimmed.starts_with('!')
+    || trimmed.starts_with('?')
+    || trimmed.starts_with(';')
+  {
+    return true;
+  }
+  // Necessary: must start with ASCII letter, digit, or underscore
+  // (rejects leading `-` / `:` which SCRIPT_RE alone would allow).
+  !matches!(
+    trimmed.chars().next(),
+    Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_')
+  )
+}
+
+/// Authoritative runnable script name check (scan + start/stop).
+/// Keep in sync with frontend `isListedScriptName` in `src/stores/project.ts`.
+fn is_listed_script_name(name: &str) -> bool {
+  !is_pseudo_comment_script_key(name) && is_valid_script(name.trim())
+}
+
 fn is_valid_package_manager(pm: &str) -> bool {
   matches!(pm, "npm" | "pnpm" | "yarn")
 }
@@ -215,7 +252,8 @@ fn parse_package_json(path: &Path) -> Option<Vec<(String, String)>> {
   Some(
     scripts
       .iter()
-      .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+      .filter(|(k, _)| is_listed_script_name(k))
+      .map(|(k, v)| (k.trim().to_string(), v.as_str().unwrap_or("").to_string()))
       .collect(),
   )
 }
@@ -431,10 +469,11 @@ pub fn start_project(
     }
   };
 
-  if !is_valid_script(&script) {
+  if !is_listed_script_name(&script) {
     return StartResult {
       success: false,
-      message: "非法脚本名：仅允许字母、数字、下划线、连字符和冒号".to_string(),
+      message: "非法脚本名：已过滤注释/元数据类脚本（//、#、@ 等），且须以字母数字或 _ 开头"
+        .to_string(),
       project_id: run_id_from(&path, &script),
     };
   }
@@ -576,7 +615,7 @@ pub fn install_project(
 #[tauri::command]
 pub fn stop_project(app_handle: AppHandle, path: String, script: String) -> Result<bool, String> {
   validate_path_input(&path)?;
-  if script != "install" && !is_valid_script(&script) {
+  if script != "install" && !is_listed_script_name(&script) {
     return Err("非法脚本名".to_string());
   }
   let project_id = run_id_from(&path, &script);
