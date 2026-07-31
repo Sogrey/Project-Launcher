@@ -20,6 +20,12 @@ export interface AppConfig {
   workspaces: Workspace[]
 }
 
+export interface InstalledIde {
+  id: string
+  name: string
+  path: string
+}
+
 export type PackageManager = 'npm' | 'pnpm' | 'yarn'
 
 /** Match Rust `is_listed_script_name` in commands.rs — keep rules in sync. */
@@ -103,6 +109,11 @@ export const useProjectStore = defineStore('project', () => {
   const packageManager = ref<PackageManager>('npm')
   const todayStartCount = ref(0)
   const initialized = ref(false)
+  /** Detected editors — loaded once per app session (registry scan is slow). */
+  const installedIdes = ref<InstalledIde[]>([])
+  const idesReady = ref(false)
+  const idesLoading = ref(false)
+  let idesLoadPromise: Promise<void> | null = null
 
   const activeWorkspace = computed(
     () => workspaces.value.find((w) => w.id === activeWorkspaceId.value) || null
@@ -143,12 +154,14 @@ export const useProjectStore = defineStore('project', () => {
     return epoch
   }
 
-  function clearRunRuntime(runId: string) {
+  function clearRunRuntime(runId: string, options?: { keepLogs?: boolean }) {
     runningRuns.value.delete(runId)
     runPorts.value.delete(runId)
-    runLogs.value.delete(runId)
     pendingStopEpoch.value.delete(runId)
-    if (selectedRunId.value === runId) {
+    if (!options?.keepLogs) {
+      runLogs.value.delete(runId)
+    }
+    if (selectedRunId.value === runId && !options?.keepLogs) {
       selectedRunId.value = null
     }
   }
@@ -272,6 +285,40 @@ export const useProjectStore = defineStore('project', () => {
       toastError(`加载配置失败: ${errorMessage(err)}`)
       initialized.value = true
     }
+  }
+
+  /** Scan installed IDEs once; subsequent calls reuse the cached list. */
+  async function ensureInstalledIdes() {
+    if (idesReady.value) return
+    if (idesLoadPromise) return idesLoadPromise
+
+    idesLoading.value = true
+    idesLoadPromise = (async () => {
+      const IDE_SCAN_TIMEOUT_MS = 10_000
+      try {
+        const list = await Promise.race([
+          invoke<InstalledIde[]>('list_installed_ides'),
+          new Promise<never>((_, reject) => {
+            window.setTimeout(
+              () => reject(new Error('IDE 检测超时')),
+              IDE_SCAN_TIMEOUT_MS
+            )
+          }),
+        ])
+        installedIdes.value = list
+        idesReady.value = true
+      } catch (err) {
+        console.error('list_installed_ides failed', err)
+        installedIdes.value = []
+        // Allow retry on next open if the first scan failed/timed out.
+        idesReady.value = false
+      } finally {
+        idesLoading.value = false
+        idesLoadPromise = null
+      }
+    })()
+
+    return idesLoadPromise
   }
 
   /** Open / close the project management drawer. Does not clear log focus. */
@@ -608,25 +655,17 @@ export const useProjectStore = defineStore('project', () => {
       return
     }
 
-    // Natural exit of current instance (or stop without pending epoch).
-    if (run && pending === undefined) {
-      // Could be exit of older instance after restart: epoch already bumped.
-      // Without backend epoch we only clear if this is still the tracked run —
-      // which it is if restart bumped epoch and replaced the map entry.
-      // Stale exit for old process: old process was removed from backend map on
-      // kill, so exit usually isn't emitted. Safe to clear current.
-    }
-
     const exitedRun = run
-    clearRunRuntime(runId)
-
     if (!success && exitedRun) {
+      // Keep logs so the 异常 panel can reopen them in the log pane.
+      clearRunRuntime(runId, { keepLogs: true })
       erroredRuns.value.set(runId, {
         runId,
         project: exitedRun.project,
         script: exitedRun.script,
       })
     } else {
+      clearRunRuntime(runId)
       erroredRuns.value.delete(runId)
     }
   }
@@ -665,6 +704,21 @@ export const useProjectStore = defineStore('project', () => {
 
   function clearError(runId: string) {
     erroredRuns.value.delete(runId)
+    runLogs.value.delete(runId)
+    if (selectedRunId.value === runId) {
+      selectedRunId.value = null
+    }
+  }
+
+  async function reorderProjects(fromIndex: number, toIndex: number) {
+    if (fromIndex === toIndex) return
+    if (fromIndex < 0 || toIndex < 0) return
+    if (fromIndex >= projects.value.length || toIndex >= projects.value.length) return
+    const next = [...projects.value]
+    const [item] = next.splice(fromIndex, 1)
+    next.splice(toIndex, 0, item)
+    projects.value = next
+    await persistConfig()
   }
 
   return {
@@ -688,7 +742,11 @@ export const useProjectStore = defineStore('project', () => {
     erroredCount,
     runningRunList,
     erroredRunList,
+    installedIdes,
+    idesReady,
+    idesLoading,
     loadPersistedState,
+    ensureInstalledIdes,
     createWorkspace,
     switchWorkspace,
     renameWorkspace,
@@ -721,5 +779,6 @@ export const useProjectStore = defineStore('project', () => {
     clearLogs,
     logsForRun,
     clearError,
+    reorderProjects,
   }
 })
