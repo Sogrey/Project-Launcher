@@ -8,6 +8,7 @@ use tauri::{
 };
 
 mod commands;
+mod ide;
 
 fn main() {
   tauri::Builder::default()
@@ -24,6 +25,9 @@ fn main() {
       commands::load_app_config,
       commands::save_app_config,
       commands::create_workspace_id,
+      ide::list_installed_ides,
+      ide::open_in_explorer,
+      ide::open_in_ide,
     ])
     .setup(|app| {
       let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;

@@ -59,7 +59,7 @@ fn validate_path_input(path: &str) -> Result<(), String> {
 }
 
 /// Validate and canonicalize a directory path from the frontend.
-fn validate_dir_path(path: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_dir_path(path: &str) -> Result<PathBuf, String> {
   validate_path_input(path)?;
 
   let raw = Path::new(path);
