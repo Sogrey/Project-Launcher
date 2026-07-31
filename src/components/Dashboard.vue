@@ -13,28 +13,144 @@ const newWorkspaceName = ref('')
 const renamingId = ref<string | null>(null)
 const renameValue = ref('')
 
-const focusedRun = computed(() =>
-  store.selectedRunId ? store.runningRuns.get(store.selectedRunId) || null : null
-)
+const focusedMeta = computed(() => {
+  const id = store.selectedRunId
+  if (!id) return null
+  const running = store.runningRuns.get(id)
+  if (running) {
+    return {
+      name: running.project.name,
+      script: running.script,
+      kind: 'running' as const,
+    }
+  }
+  const errored = store.erroredRuns.get(id)
+  if (errored) {
+    return {
+      name: errored.project.name,
+      script: errored.script,
+      kind: 'errored' as const,
+    }
+  }
+  return null
+})
 
 const focusedLogs = computed(() =>
   store.selectedRunId ? store.logsForRun(store.selectedRunId) : []
 )
 
 const focusedLogLabel = computed(() => {
-  if (!focusedRun.value) return ''
-  return `${focusedRun.value.project.name} / ${focusedRun.value.script}`
+  if (!focusedMeta.value) return ''
+  const tag = focusedMeta.value.kind === 'errored' ? '异常' : ''
+  const base = `${focusedMeta.value.name} / ${focusedMeta.value.script}`
+  return tag ? `${base} · ${tag}` : base
 })
 
-// If focused run disappears from running list, clear focus.
+const showLogPanel = computed(
+  () => !!store.selectedRunId && (!!focusedMeta.value || focusedLogs.value.length > 0)
+)
+
+// Clear log focus only when the run is gone from both running and errored lists.
 watch(
-  () => store.runningRunList.map((r) => r.runId),
-  (ids) => {
-    if (store.selectedRunId && !ids.includes(store.selectedRunId)) {
-      store.selectRun(null)
-    }
+  () => ({
+    running: store.runningRunList.map((r) => r.runId),
+    errored: store.erroredRunList.map((r) => r.runId),
+  }),
+  ({ running, errored }) => {
+    const id = store.selectedRunId
+    if (!id) return
+    if (running.includes(id) || errored.includes(id)) return
+    store.selectRun(null)
   }
 )
+
+const dragFromIndex = ref<number | null>(null)
+const dragOverIndex = ref<number | null>(null)
+let suppressProjectClick = false
+
+function onProjectDragStart(event: DragEvent, index: number) {
+  // Prefer dragging from the handle; allow whole card as fallback.
+  const target = event.target as HTMLElement | null
+  const fromHandle = Boolean(target?.closest?.('.drag-handle'))
+  if (!fromHandle && target?.closest?.('button')) {
+    event.preventDefault()
+    return
+  }
+  dragFromIndex.value = index
+  suppressProjectClick = false
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+}
+
+function onProjectDragOver(event: DragEvent, index: number) {
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+  if (dragFromIndex.value === null || dragFromIndex.value === index) {
+    dragOverIndex.value = null
+    return
+  }
+  dragOverIndex.value = index
+}
+
+function onProjectDragLeave(index: number) {
+  if (dragOverIndex.value === index) dragOverIndex.value = null
+}
+
+async function onProjectDrop(event: DragEvent, toIndex: number) {
+  event.preventDefault()
+  event.stopPropagation()
+  const fromIndex = dragFromIndex.value
+  dragOverIndex.value = null
+  if (fromIndex === null || fromIndex === toIndex) {
+    dragFromIndex.value = null
+    return
+  }
+  suppressProjectClick = true
+  try {
+    await store.reorderProjects(fromIndex, toIndex)
+  } catch {
+    // store already shows error
+  } finally {
+    dragFromIndex.value = null
+  }
+}
+
+function onProjectDragEnd() {
+  dragFromIndex.value = null
+  dragOverIndex.value = null
+  // Drop may set this to suppress the following click; always clear leftovers.
+  // Use a microtask so the click from the same gesture can still see `true`.
+  queueMicrotask(() => {
+    suppressProjectClick = false
+  })
+}
+
+function handleProjectClick(project: Project) {
+  if (suppressProjectClick) {
+    suppressProjectClick = false
+    return
+  }
+  store.selectProject(project.path)
+}
+
+function handleRunClick(runId: string) {
+  store.selectRun(runId)
+}
+
+function handleErrorClick(runId: string) {
+  store.selectRun(runId)
+}
+
+function handleCloseDetail() {
+  store.selectProject(null)
+}
+
+function clearLogFocus() {
+  store.selectRun(null)
+}
 
 async function handleAddProject() {
   try {
@@ -109,23 +225,6 @@ async function handleDeleteWorkspace(id: string, name: string) {
 
 async function handleOpenUrl(port: string) {
   await openUrl(`http://localhost:${port}`)
-}
-
-function handleProjectClick(project: Project) {
-  store.selectProject(project.path)
-}
-
-function handleRunClick(runId: string) {
-  store.selectRun(runId)
-}
-
-/** Close project drawer only — log focus stays on the selected running task. */
-function handleCloseDetail() {
-  store.selectProject(null)
-}
-
-function clearLogFocus() {
-  store.selectRun(null)
 }
 
 function getRunPorts(runId: string) {
@@ -244,16 +343,25 @@ function handleClearError(runId: string) {
           </button>
 
           <div
-            v-for="project in store.projects"
+            v-for="(project, index) in store.projects"
             :key="project.path"
             class="tile project-tile"
             :class="{
               selected: store.selectedProjectPath === project.path,
               running: store.hasRunningScripts(project.path),
+              dragging: dragFromIndex === index,
+              'drag-over': dragOverIndex === index && dragFromIndex !== index,
             }"
+            draggable="true"
+            @dragstart="onProjectDragStart($event, index)"
+            @dragover="onProjectDragOver($event, index)"
+            @dragleave="onProjectDragLeave(index)"
+            @drop="onProjectDrop($event, index)"
+            @dragend="onProjectDragEnd"
             @click="handleProjectClick(project)"
           >
             <div class="tile-header">
+              <span class="drag-handle" title="拖拽排序" @click.stop>⋮⋮</span>
               <span
                 class="status-dot"
                 :class="store.hasRunningScripts(project.path) ? 'running' : 'stopped'"
@@ -347,7 +455,12 @@ function handleClearError(runId: string) {
           <div class="column-header">
             <span class="column-dot running"></span>
             <h2>日志输出</h2>
-            <span v-if="focusedLogLabel" class="log-focus-tag" :title="focusedLogLabel">
+            <span
+              v-if="focusedLogLabel"
+              class="log-focus-tag"
+              :class="{ errored: focusedMeta?.kind === 'errored' }"
+              :title="focusedLogLabel"
+            >
               {{ focusedLogLabel }}
             </span>
             <button
@@ -361,7 +474,7 @@ function handleClearError(runId: string) {
           </div>
           <div class="log-body">
             <LogPanel
-              v-if="store.selectedRunId && focusedRun"
+              v-if="showLogPanel && store.selectedRunId"
               :key="store.selectedRunId"
               :project-path="store.selectedRunId"
               :logs="focusedLogs"
@@ -369,8 +482,8 @@ function handleClearError(runId: string) {
               @clear="store.clearLogs(store.selectedRunId!)"
             />
             <div v-else class="empty-column log-empty">
-              <p>选择中间列正在运行的任务</p>
-              <p class="hint">以查看对应实时日志</p>
+              <p>选择中间列运行中任务，或下方异常记录</p>
+              <p class="hint">在右上查看对应日志</p>
             </div>
           </div>
         </div>
@@ -386,7 +499,8 @@ function handleClearError(runId: string) {
               v-for="run in store.erroredRunList"
               :key="run.runId"
               class="error-row"
-              @click="handleProjectClick(run.project)"
+              :class="{ selected: store.selectedRunId === run.runId }"
+              @click="handleErrorClick(run.runId)"
             >
               <div class="error-main">
                 <span class="error-name">{{ run.project.name }}</span>
@@ -844,6 +958,18 @@ function handleClearError(runId: string) {
   background: rgba(251, 113, 133, 0.12);
 }
 
+.error-row.selected {
+  border-color: rgba(251, 113, 133, 0.55);
+  background: rgba(251, 113, 133, 0.16);
+  box-shadow: 0 0 12px rgba(251, 113, 133, 0.15);
+}
+
+.log-focus-tag.errored {
+  color: var(--accent-rose);
+  background: rgba(251, 113, 133, 0.12);
+  border-color: rgba(251, 113, 133, 0.35);
+}
+
 .error-main {
   flex: 1;
   min-width: 0;
@@ -925,6 +1051,36 @@ function handleClearError(runId: string) {
 
 .project-tile.running {
   border-color: rgba(52, 211, 153, 0.35);
+}
+
+.project-tile {
+  -webkit-user-drag: element;
+  user-select: none;
+}
+
+.project-tile.dragging {
+  opacity: 0.45;
+}
+
+.project-tile.drag-over {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.45);
+}
+
+.drag-handle {
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: -2px;
+  cursor: grab;
+  user-select: none;
+  flex-shrink: 0;
+  padding: 4px 2px;
+  line-height: 1;
+  touch-action: none;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
 }
 
 .tile-header {

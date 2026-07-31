@@ -22,10 +22,45 @@ let writtenCount = 0
 let resizeObserver: ResizeObserver | null = null
 const autoScroll = ref(true)
 
+/** Prefer readable line length; narrow panels scroll horizontally instead of mid-word wrap. */
+const MIN_COLS = 160
+
+function syncHorizontalScroll() {
+  const termEl = terminal?.element
+  const screen = termEl?.querySelector('.xterm-screen') as HTMLElement | null
+  if (!termEl || !screen) return
+  // Canvases are position:absolute and do not expand scrollWidth; pin screen min-width.
+  const canvas = screen.querySelector('canvas')
+  const width = canvas?.offsetWidth || screen.offsetWidth
+  if (width > 0) {
+    screen.style.minWidth = `${width}px`
+  }
+}
+
+function fitTerminal() {
+  if (!terminal || !fitAddon || !terminal.element) return
+  try {
+    // Measure against the panel width (not a previously expanded term width).
+    terminal.element.style.width = '100%'
+    fitAddon.fit()
+    const rows = Math.max(terminal.rows || 0, 8)
+    if (terminal.cols > 0 && terminal.cols < MIN_COLS) {
+      terminal.resize(MIN_COLS, rows)
+    }
+    terminal.element.style.width = '100%'
+    requestAnimationFrame(syncHorizontalScroll)
+  } catch (err) {
+    console.warn('fitTerminal failed', err)
+  }
+}
+
 onMounted(() => {
   terminal = new Terminal({
+    convertEol: true,
     fontSize: 12,
     fontFamily: 'JetBrains Mono, Cascadia Code, Consolas, monospace',
+    lineHeight: 1.25,
+    letterSpacing: 0,
     theme: {
       background: '#0a121f',
       foreground: '#c8e0f8',
@@ -33,7 +68,7 @@ onMounted(() => {
       selectionBackground: 'rgba(56, 189, 248, 0.35)',
     },
     cursorBlink: false,
-    scrollback: 1000,
+    scrollback: 5000,
   })
 
   fitAddon = new FitAddon()
@@ -41,7 +76,7 @@ onMounted(() => {
 
   if (terminalContainer.value) {
     terminal.open(terminalContainer.value)
-    fitAddon.fit()
+    fitTerminal()
 
     props.logs.forEach((log) => {
       terminal?.write(log)
@@ -49,7 +84,7 @@ onMounted(() => {
     writtenCount = props.logs.length
 
     resizeObserver = new ResizeObserver(() => {
-      fitAddon?.fit()
+      fitTerminal()
     })
     resizeObserver.observe(terminalContainer.value)
   }
@@ -92,7 +127,7 @@ function handleClear() {
 
 function handleFit() {
   nextTick(() => {
-    fitAddon?.fit()
+    fitTerminal()
   })
 }
 </script>
@@ -121,6 +156,7 @@ function handleFit() {
   border-radius: 8px;
   border: 1px solid rgba(56, 189, 248, 0.2);
   overflow: hidden;
+  min-width: 0;
 }
 
 .log-panel.fill {
@@ -160,7 +196,7 @@ function handleFit() {
 }
 
 .auto-scroll-label input {
-  accent-color: #667eea;
+  accent-color: #38bdf8;
 }
 
 .clear-btn {
@@ -172,6 +208,7 @@ function handleFit() {
   font-size: 12px;
   cursor: pointer;
   transition: all 0.2s;
+  font-family: inherit;
 }
 
 .clear-btn:hover {
@@ -182,6 +219,8 @@ function handleFit() {
   height: 200px;
   overflow: hidden;
   padding: 4px;
+  box-sizing: border-box;
+  min-width: 0;
 }
 
 .log-panel.fill .log-content {
@@ -192,5 +231,50 @@ function handleFit() {
 
 .log-content :deep(.xterm) {
   height: 100%;
+  width: 100% !important;
+  max-width: 100%;
+  box-sizing: border-box;
+  /* Screen is wider than the panel when MIN_COLS > fitted cols */
+  overflow-x: scroll !important;
+  overflow-y: hidden !important;
+}
+
+.log-content :deep(.xterm-viewport) {
+  /* Vertical scroll stays on the visible panel edge */
+  overflow-y: scroll !important;
+  overflow-x: hidden !important;
+}
+
+.log-content :deep(.xterm-screen) {
+  /* In-flow width from xterm drives horizontal scrollWidth */
+  position: relative;
+}
+
+.log-content :deep(.xterm-rows) {
+  word-break: normal;
+}
+
+/* WebView often hides overlay scrollbars; force a visible horizontal bar */
+.log-content :deep(.xterm)::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+
+.log-content :deep(.xterm)::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.45);
+  border-radius: 5px;
+}
+
+.log-content :deep(.xterm)::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.log-content :deep(.xterm-viewport)::-webkit-scrollbar {
+  width: 10px;
+}
+
+.log-content :deep(.xterm-viewport)::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.35);
+  border-radius: 5px;
 }
 </style>

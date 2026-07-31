@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { useProjectStore, type Project } from '@/stores/project'
 import { toastSuccess, toastError } from '@/utils/toast'
 import { open } from '@tauri-apps/plugin-shell'
@@ -14,8 +15,30 @@ const emit = defineEmits<{
 
 const store = useProjectStore()
 
+const IDE_PREF_KEY = 'project-launcher:preferred-ide'
+
+const selectedIdeId = ref('')
+const busyExplorer = ref(false)
+const busyIde = ref(false)
+
 const runningScripts = computed(() => store.runningScriptsFor(props.project.path))
 const isAnyRunning = computed(() => runningScripts.value.length > 0)
+const selectedIdeLabel = computed(() => {
+  const ide = store.installedIdes.find((i) => i.id === selectedIdeId.value)
+  return ide?.name ?? 'IDE'
+})
+
+function syncPreferredIde() {
+  const list = store.installedIdes
+  const preferred = localStorage.getItem(IDE_PREF_KEY) || ''
+  if (preferred && list.some((i) => i.id === preferred)) {
+    selectedIdeId.value = preferred
+  } else if (list.length > 0) {
+    selectedIdeId.value = list[0].id
+  } else {
+    selectedIdeId.value = ''
+  }
+}
 const erroredScripts = computed(() =>
   store.erroredRunList
     .filter((run) => run.project.path === props.project.path)
@@ -62,8 +85,59 @@ function isScriptRunning(script: string) {
   return store.isScriptRunning(props.project.path, script)
 }
 
+async function loadInstalledIdes() {
+  await store.ensureInstalledIdes()
+  syncPreferredIde()
+}
+
+watch(selectedIdeId, (id) => {
+  if (id) localStorage.setItem(IDE_PREF_KEY, id)
+})
+
+watch(
+  () => store.installedIdes,
+  () => syncPreferredIde(),
+  { deep: true }
+)
+
+onMounted(() => {
+  void loadInstalledIdes()
+})
+
 async function openUrl(port: string) {
   await open(`http://localhost:${port}`)
+}
+
+async function handleOpenExplorer() {
+  if (busyExplorer.value) return
+  busyExplorer.value = true
+  try {
+    await invoke('open_in_explorer', { path: props.project.path })
+  } catch (e) {
+    toastError(e instanceof Error ? e.message : '打开目录失败')
+  } finally {
+    busyExplorer.value = false
+  }
+}
+
+async function handleOpenIde() {
+  if (busyIde.value) return
+  if (!selectedIdeId.value) {
+    toastError('未检测到已安装的 IDE')
+    return
+  }
+  busyIde.value = true
+  try {
+    await invoke('open_in_ide', {
+      path: props.project.path,
+      ideId: selectedIdeId.value,
+    })
+    toastSuccess(`已在 ${selectedIdeLabel.value} 中打开`)
+  } catch (e) {
+    toastError(e instanceof Error ? e.message : '用 IDE 打开失败')
+  } finally {
+    busyIde.value = false
+  }
 }
 
 async function handleScriptClick(script: string) {
@@ -174,6 +248,45 @@ async function handleRemove() {
               </button>
             </div>
             <p class="project-path">{{ project.path }}</p>
+            <div class="path-actions">
+              <button
+                class="path-action-btn"
+                :disabled="busyExplorer"
+                title="在资源管理器中打开项目目录"
+                @click="handleOpenExplorer"
+              >
+                打开目录
+              </button>
+              <div class="ide-open-group">
+                <select
+                  v-model="selectedIdeId"
+                  class="ide-select"
+                  :disabled="store.idesLoading || store.installedIdes.length === 0"
+                  title="选择已安装的 IDE"
+                >
+                  <option v-if="store.idesLoading" value="" disabled>检测 IDE 中…</option>
+                  <option v-else-if="store.installedIdes.length === 0" value="" disabled>
+                    未检测到 IDE
+                  </option>
+                  <option
+                    v-for="ide in store.installedIdes"
+                    :key="ide.id"
+                    :value="ide.id"
+                    :title="ide.path"
+                  >
+                    {{ ide.name }}
+                  </option>
+                </select>
+                <button
+                  class="path-action-btn ide-open-btn"
+                  :disabled="busyIde || !selectedIdeId"
+                  title="用所选 IDE 打开项目目录"
+                  @click="handleOpenIde"
+                >
+                  在 IDE 中打开
+                </button>
+              </div>
+            </div>
           </div>
         </div>
         <button class="close-btn" @click="emit('close')">
@@ -392,6 +505,106 @@ async function handleRemove() {
   word-break: break-all;
 }
 
+.path-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ide-open-group {
+  display: inline-flex;
+  align-items: stretch;
+  min-width: 0;
+  flex: 1 1 auto;
+  max-width: 100%;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.ide-open-group:focus-within {
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+.path-action-btn {
+  flex-shrink: 0;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.08);
+  color: #7dd3fc;
+  font-size: 12px;
+  font-family: inherit;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.path-action-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.16);
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+.path-action-btn.primary {
+  background: rgba(56, 189, 248, 0.18);
+  color: #e0f2fe;
+}
+
+.path-action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Joined control: select + open button share one outline */
+.ide-open-group .ide-select {
+  min-width: 0;
+  flex: 1 1 110px;
+  max-width: none;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #c8e0f8;
+  font-size: 12px;
+  font-family: inherit;
+  padding: 5px 8px;
+  outline: none;
+  box-shadow: none;
+}
+
+.ide-open-group .ide-select:disabled {
+  opacity: 0.55;
+}
+
+/* Keep native dropdown readable (Windows popup inherits select color otherwise). */
+.ide-open-group .ide-select,
+.ide-open-group .ide-select option {
+  color-scheme: dark;
+}
+
+.ide-open-group .ide-select option {
+  background-color: #0b1220;
+  color: #e8f1ff;
+}
+
+.ide-open-group .path-action-btn {
+  border: none;
+  border-left: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 0;
+  background: rgba(56, 189, 248, 0.14);
+  white-space: nowrap;
+}
+
+.ide-open-group .path-action-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.24);
+  border-color: rgba(56, 189, 248, 0.28);
+}
+
+.ide-open-group .path-action-btn:disabled {
+  opacity: 0.45;
+}
+
 .close-btn {
   background: none;
   border: none;
@@ -605,6 +818,12 @@ async function handleRemove() {
   color: #e8f1ff;
   font-size: 14px;
   font-family: inherit;
+  color-scheme: dark;
+}
+
+.pm-select-native option {
+  background-color: #0b1220;
+  color: #e8f1ff;
 }
 
 .install-btn {

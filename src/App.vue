@@ -9,6 +9,8 @@ const unlistens: UnlistenFn[] = []
 
 onMounted(async () => {
   await store.loadPersistedState()
+  // Prefetch IDE list in background so opening the drawer stays snappy.
+  void store.ensureInstalledIdes()
 
   unlistens.push(
     await listen<string>('project:stopped', (event) => {
