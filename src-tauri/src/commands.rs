@@ -231,11 +231,107 @@ fn kill_process_tree(child: &mut Child) {
   let _ = child.wait();
 }
 
+fn default_package_manager() -> String {
+  "npm".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
   pub name: String,
   pub path: String,
   pub scripts: Vec<(String, String)>,
+  /// Preferred package manager for this project (`npm` | `pnpm` | `yarn`).
+  #[serde(default = "default_package_manager", rename = "packageManager")]
+  pub package_manager: String,
+}
+
+/// Parse Corepack-style `packageManager` / `devEngines.packageManager` values.
+fn pm_name_from_field(value: &serde_json::Value) -> Option<String> {
+  match value {
+    serde_json::Value::String(s) => {
+      let name = s
+        .trim()
+        .trim_start_matches('^')
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+      match name.as_str() {
+        "npm" | "pnpm" | "yarn" => Some(name),
+        _ => None, // bun etc. — fall through to lockfile / default
+      }
+    }
+    serde_json::Value::Object(map) => {
+      let name = map
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+      match name.as_str() {
+        "npm" | "pnpm" | "yarn" => Some(name),
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+fn read_declared_package_manager(dir: &Path) -> Option<String> {
+  let content = std::fs::read_to_string(dir.join("package.json")).ok()?;
+  let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+  if let Some(pm) = json.get("packageManager").and_then(pm_name_from_field) {
+    return Some(pm);
+  }
+  if let Some(pm) = json
+    .get("devEngines")
+    .and_then(|d| d.get("packageManager"))
+    .and_then(pm_name_from_field)
+  {
+    return Some(pm);
+  }
+  None
+}
+
+fn read_lockfile_package_manager(dir: &Path) -> Option<String> {
+  if dir.join("pnpm-lock.yaml").is_file() {
+    return Some("pnpm".to_string());
+  }
+  if dir.join("yarn.lock").is_file() {
+    return Some("yarn".to_string());
+  }
+  if dir.join("package-lock.json").is_file() || dir.join("npm-shrinkwrap.json").is_file() {
+    return Some("npm".to_string());
+  }
+  None
+}
+
+/// Detect preferred PM: package.json declaration → lockfile → walk parents → default npm.
+pub(crate) fn detect_package_manager_for_dir(start: &Path) -> String {
+  let mut dir = start.to_path_buf();
+  for _ in 0..5 {
+    if let Some(pm) = read_declared_package_manager(&dir) {
+      return pm;
+    }
+    if let Some(pm) = read_lockfile_package_manager(&dir) {
+      return pm;
+    }
+    if !dir.pop() {
+      break;
+    }
+  }
+  default_package_manager()
+}
+
+fn project_from_dir(path: &Path) -> Option<Project> {
+  let scripts = parse_package_json(path)?;
+  Some(Project {
+    name: project_name_from_path(path),
+    path: path_to_string(path),
+    scripts,
+    package_manager: detect_package_manager_for_dir(path),
+  })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,13 +377,8 @@ fn scan_directory_recursive(dir: &Path, depth: usize, max_depth: usize) -> Vec<P
       }
 
       if path.join("package.json").exists() {
-        let name = project_name_from_path(&path);
-        if let Some(scripts) = parse_package_json(&path) {
-          projects.push(Project {
-            name,
-            path: path_to_string(&path),
-            scripts,
-          });
+        if let Some(project) = project_from_dir(&path) {
+          projects.push(project);
         }
       } else {
         projects.extend(scan_directory_recursive(&path, depth + 1, max_depth));
@@ -431,15 +522,10 @@ pub fn scan_project(path: String) -> Result<Option<Project>, String> {
   let dir = validate_dir_path(&path)?;
 
   if dir.join("package.json").exists() {
-    let name = project_name_from_path(&dir);
-    if let Some(scripts) = parse_package_json(&dir) {
-      return Ok(Some(Project {
-        name,
-        path: path_to_string(&dir),
-        scripts,
-      }));
-    }
-    return Err("package.json 存在但无法解析 scripts".to_string());
+    return match project_from_dir(&dir) {
+      Some(p) => Ok(Some(p)),
+      None => Err("package.json 存在但无法解析 scripts".to_string()),
+    };
   }
 
   Ok(None)
@@ -449,6 +535,13 @@ pub fn scan_project(path: String) -> Result<Option<Project>, String> {
 pub fn scan_directory(path: String) -> Result<Vec<Project>, String> {
   let dir = validate_dir_path(&path)?;
   Ok(scan_directory_recursive(&dir, 0, 3))
+}
+
+/// Re-detect preferred package manager for an existing project directory.
+#[tauri::command]
+pub fn detect_package_manager(path: String) -> Result<String, String> {
+  let dir = validate_dir_path(&path)?;
+  Ok(detect_package_manager_for_dir(&dir))
 }
 
 #[tauri::command]

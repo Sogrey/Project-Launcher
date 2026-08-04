@@ -18,6 +18,7 @@ fn main() {
     .invoke_handler(tauri::generate_handler![
       commands::scan_project,
       commands::scan_directory,
+      commands::detect_package_manager,
       commands::start_project,
       commands::install_project,
       commands::stop_project,
