@@ -7,6 +7,8 @@ export interface Project {
   name: string
   path: string
   scripts: [string, string][]
+  /** Per-project preference; detected from package.json / lockfile. */
+  packageManager?: PackageManager
 }
 
 export interface Workspace {
@@ -28,8 +30,15 @@ export interface InstalledIde {
 
 export type PackageManager = 'npm' | 'pnpm' | 'yarn'
 
+const DEFAULT_PACKAGE_MANAGER: PackageManager = 'npm'
+
 /** Match Rust `is_listed_script_name` in commands.rs — keep rules in sync. */
 const RUNNABLE_SCRIPT_RE = /^[a-zA-Z0-9_:-]+$/
+
+export function normalizePackageManager(pm: unknown): PackageManager {
+  if (pm === 'pnpm' || pm === 'yarn' || pm === 'npm') return pm
+  return DEFAULT_PACKAGE_MANAGER
+}
 
 /** Mirrors Rust `is_listed_script_name` in `commands.rs` — keep in sync. */
 export function isListedScriptName(name: string): boolean {
@@ -55,8 +64,13 @@ export function isListedScriptName(name: string): boolean {
 export function sanitizeProjectScripts(project: Project): Project {
   return {
     ...project,
+    packageManager: normalizePackageManager(project.packageManager),
     scripts: project.scripts.filter(([name]) => isListedScriptName(name)),
   }
+}
+
+export function packageManagerFor(project: Project): PackageManager {
+  return normalizePackageManager(project.packageManager)
 }
 
 /** One running script instance (a project may have several). */
@@ -106,7 +120,8 @@ export const useProjectStore = defineStore('project', () => {
   const selectedProjectPath = ref<string | null>(null)
   /** When set, detail drawer is for a single running script. */
   const selectedRunId = ref<string | null>(null)
-  const packageManager = ref<PackageManager>('npm')
+  /** @deprecated Prefer per-project `project.packageManager`; kept as fallback default. */
+  const packageManager = ref<PackageManager>(DEFAULT_PACKAGE_MANAGER)
   const todayStartCount = ref(0)
   const initialized = ref(false)
   /** Detected editors — loaded once per app session (registry scan is slow). */
@@ -515,16 +530,42 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  async function setProjectPackageManager(path: string, pm: PackageManager) {
+    const idx = projects.value.findIndex((p) => p.path === path)
+    if (idx < 0) return
+    const next = normalizePackageManager(pm)
+    if (projects.value[idx].packageManager === next) return
+    projects.value[idx] = { ...projects.value[idx], packageManager: next }
+    await persistConfig()
+  }
+
+  /** Re-read package.json / lockfile and update the project's preferred PM. */
+  async function refreshProjectPackageManager(path: string) {
+    try {
+      const detected = normalizePackageManager(
+        await invoke<string>('detect_package_manager', { path })
+      )
+      await setProjectPackageManager(path, detected)
+      return detected
+    } catch (err) {
+      console.error('detect_package_manager failed', err)
+      return packageManagerFor(
+        projects.value.find((p) => p.path === path) || { name: '', path, scripts: [] }
+      )
+    }
+  }
+
   async function startProject(project: Project, script: string) {
     if (!isListedScriptName(script)) {
       toastWarning('非法脚本名（注释/元数据类脚本不可运行）')
       return { success: false, message: '非法脚本名', project_id: '' }
     }
+    const pm = packageManagerFor(project)
     const runId = runIdFor(project.path, script)
     try {
       const result = await invoke<{ success: boolean; message: string; project_id: string }>(
         'start_project',
-        { path: project.path, script, packageManager: packageManager.value }
+        { path: project.path, script, packageManager: pm }
       )
 
       if (result.success) {
@@ -535,7 +576,7 @@ export const useProjectStore = defineStore('project', () => {
           runId: id,
           project,
           script,
-          packageManager: packageManager.value,
+          packageManager: pm,
           epoch,
         })
         runLogs.value.set(id, [])
@@ -550,11 +591,12 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function installProject(project: Project) {
+    const pm = packageManagerFor(project)
     const runId = runIdFor(project.path, 'install')
     try {
       const result = await invoke<{ success: boolean; message: string; project_id: string }>(
         'install_project',
-        { path: project.path, packageManager: packageManager.value }
+        { path: project.path, packageManager: pm }
       )
 
       if (result.success) {
@@ -565,7 +607,7 @@ export const useProjectStore = defineStore('project', () => {
           runId: id,
           project,
           script: 'install',
-          packageManager: packageManager.value,
+          packageManager: pm,
           epoch,
         })
         runLogs.value.set(id, [])
@@ -736,6 +778,8 @@ export const useProjectStore = defineStore('project', () => {
     selectedProject,
     selectedRun,
     packageManager,
+    setProjectPackageManager,
+    refreshProjectPackageManager,
     todayStartCount,
     totalProjects,
     runningCount,

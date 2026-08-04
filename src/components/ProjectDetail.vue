@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { useProjectStore, type Project } from '@/stores/project'
+import {
+  useProjectStore,
+  packageManagerFor,
+  type PackageManager,
+  type Project,
+} from '@/stores/project'
 import { toastSuccess, toastError } from '@/utils/toast'
 import { open } from '@tauri-apps/plugin-shell'
 
@@ -20,6 +25,13 @@ const IDE_PREF_KEY = 'project-launcher:preferred-ide'
 const selectedIdeId = ref('')
 const busyExplorer = ref(false)
 const busyIde = ref(false)
+
+const projectPackageManager = computed({
+  get: (): PackageManager => packageManagerFor(props.project),
+  set: (pm: PackageManager) => {
+    void store.setProjectPackageManager(props.project.path, pm)
+  },
+})
 
 const runningScripts = computed(() => store.runningScriptsFor(props.project.path))
 const isAnyRunning = computed(() => runningScripts.value.length > 0)
@@ -102,6 +114,8 @@ watch(
 
 onMounted(() => {
   void loadInstalledIdes()
+  // Sync PM from package.json / lockfile (declaration first, then lockfile, else npm).
+  void store.refreshProjectPackageManager(props.project.path)
 })
 
 async function openUrl(port: string) {
@@ -360,8 +374,9 @@ async function handleRemove() {
 
         <div class="section">
           <h3 class="section-title">包管理器</h3>
+          <p class="section-hint">优先读取 package.json 的 packageManager；否则看锁文件；都没有则默认 npm</p>
           <div class="pm-selector">
-            <select v-model="store.packageManager" class="pm-select-native">
+            <select v-model="projectPackageManager" class="pm-select-native">
               <option value="npm">npm</option>
               <option value="pnpm">pnpm</option>
               <option value="yarn">yarn</option>
@@ -372,7 +387,7 @@ async function handleRemove() {
             :class="{ running: isScriptRunning('install') }"
             @click="handleInstall"
           >
-            {{ isScriptRunning('install') ? '停止安装' : `${store.packageManager} install` }}
+            {{ isScriptRunning('install') ? '停止安装' : `${projectPackageManager} install` }}
           </button>
         </div>
 
