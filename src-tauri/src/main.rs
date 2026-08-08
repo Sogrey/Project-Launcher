@@ -31,16 +31,24 @@ fn main() {
       ide::open_in_ide,
     ])
     .setup(|app| {
+      let version = app.package_info().version.to_string();
+      let app_title = format!("Project Launcher v{version}");
+
+      if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title(&app_title);
+      }
+
       let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
       let stop_all_i = MenuItem::with_id(app, "stop_all", "停止所有服务", true, None::<&str>)?;
       let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-      
+
       let menu = Menu::with_items(app, &[&show_i, &stop_all_i, &quit_i])?;
-      
+
       let _tray = TrayIconBuilder::with_id("main")
         .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
           tauri::image::Image::new_owned([66, 126, 234, 255].repeat(32 * 32), 32, 32)
         }))
+        .tooltip(&app_title)
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
@@ -62,7 +70,7 @@ fn main() {
           }
         })
         .build(app)?;
-      
+
       Ok(())
     })
     .on_window_event(|window, event| {
