@@ -292,6 +292,8 @@ export const useProjectStore = defineStore('project', () => {
         toastWarning(`已过滤 ${removed} 个注释类脚本（//、#、@ 等），配置已更新`)
         await persistConfig()
       }
+      // Re-read package.json so newly added scripts appear after restart.
+      void refreshAllProjectsFromDisk()
     } catch (err) {
       const fallback = defaultConfig()
       workspaces.value = fallback.workspaces
@@ -539,20 +541,57 @@ export const useProjectStore = defineStore('project', () => {
     await persistConfig()
   }
 
-  /** Re-read package.json / lockfile and update the project's preferred PM. */
-  async function refreshProjectPackageManager(path: string) {
+  /**
+   * Re-read package.json from disk: refresh scripts + package manager.
+   * Scripts are only snapshotted at add/import time unless this runs.
+   */
+  async function refreshProjectFromDisk(path: string, options?: { persist?: boolean }) {
+    const idx = projects.value.findIndex((p) => p.path === path)
+    if (idx < 0) return null
     try {
-      const detected = normalizePackageManager(
-        await invoke<string>('detect_package_manager', { path })
-      )
-      await setProjectPackageManager(path, detected)
-      return detected
+      const result = await invoke<Project | null>('scan_project', { path })
+      if (!result) return null
+      const sanitized = sanitizeProjectScripts(result)
+      const prev = projects.value[idx]
+      const scriptsChanged =
+        prev.scripts.length !== sanitized.scripts.length ||
+        prev.scripts.some(
+          ([name, cmd], i) =>
+            sanitized.scripts[i]?.[0] !== name || sanitized.scripts[i]?.[1] !== cmd
+        )
+      const pmChanged = packageManagerFor(prev) !== packageManagerFor(sanitized)
+      if (!scriptsChanged && !pmChanged && prev.name === sanitized.name) {
+        return prev
+      }
+      projects.value[idx] = {
+        ...prev,
+        name: sanitized.name || prev.name,
+        scripts: sanitized.scripts,
+        packageManager: packageManagerFor(sanitized),
+      }
+      if (options?.persist !== false) {
+        await persistConfig()
+      }
+      return projects.value[idx]
     } catch (err) {
-      console.error('detect_package_manager failed', err)
-      return packageManagerFor(
-        projects.value.find((p) => p.path === path) || { name: '', path, scripts: [] }
-      )
+      console.error('refreshProjectFromDisk failed', path, err)
+      return null
     }
+  }
+
+  /** Refresh scripts/PM for every project in the active workspace (one persist). */
+  async function refreshAllProjectsFromDisk() {
+    const paths = projects.value.map((p) => p.path)
+    await Promise.all(paths.map((path) => refreshProjectFromDisk(path, { persist: false })))
+    await persistConfig()
+  }
+
+  /** @deprecated Prefer refreshProjectFromDisk — kept for call-site compatibility. */
+  async function refreshProjectPackageManager(path: string) {
+    const updated = await refreshProjectFromDisk(path)
+    return packageManagerFor(
+      updated || projects.value.find((p) => p.path === path) || { name: '', path, scripts: [] }
+    )
   }
 
   async function startProject(project: Project, script: string) {
@@ -779,6 +818,8 @@ export const useProjectStore = defineStore('project', () => {
     selectedRun,
     packageManager,
     setProjectPackageManager,
+    refreshProjectFromDisk,
+    refreshAllProjectsFromDisk,
     refreshProjectPackageManager,
     todayStartCount,
     totalProjects,

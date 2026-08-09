@@ -114,8 +114,6 @@ watch(
 
 onMounted(() => {
   void loadInstalledIdes()
-  // Sync PM from package.json / lockfile (declaration first, then lockfile, else npm).
-  void store.refreshProjectPackageManager(props.project.path)
 })
 
 async function openUrl(port: string) {
