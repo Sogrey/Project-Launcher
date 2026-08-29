@@ -13,7 +13,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:preview": "tauri preview",
-    "tauri:icon": "tauri icon"
+    "tauri:icon": "tauri icon",
+    "release:tag": "node scripts/release-tag.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
