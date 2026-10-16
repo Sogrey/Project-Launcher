@@ -44,5 +44,6 @@ coverage/
 # Misc
 *.tsbuildinfo
 .eslintcache
+.temp/
 
 tmp
