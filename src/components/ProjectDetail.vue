@@ -25,6 +25,7 @@ const IDE_PREF_KEY = 'project-launcher:preferred-ide'
 const selectedIdeId = ref('')
 const busyExplorer = ref(false)
 const busyIde = ref(false)
+const refreshingScripts = ref(false)
 
 const projectPackageManager = computed({
   get: (): PackageManager => packageManagerFor(props.project),
@@ -221,6 +222,25 @@ async function handleStopAllScripts() {
   }
 }
 
+async function handleRefreshScripts() {
+  if (refreshingScripts.value) return
+  refreshingScripts.value = true
+  const before = props.project.scripts.map(([name, cmd]) => `${name}\0${cmd}`).join('\n')
+  try {
+    const updated = await store.refreshProjectFromDisk(props.project.path)
+    if (!updated) {
+      toastError('刷新失败，请确认 package.json 仍存在')
+      return
+    }
+    const after = updated.scripts.map(([name, cmd]) => `${name}\0${cmd}`).join('\n')
+    toastSuccess(before === after ? '脚本列表已是最新' : '脚本列表已更新')
+  } catch (e) {
+    toastError(e instanceof Error ? e.message : '刷新失败')
+  } finally {
+    refreshingScripts.value = false
+  }
+}
+
 async function handleRemove() {
   if (
     !window.confirm(
@@ -390,7 +410,17 @@ async function handleRemove() {
         </div>
 
         <div class="section">
-          <h3 class="section-title">脚本列表</h3>
+          <div class="section-head">
+            <h3 class="section-title">脚本列表</h3>
+            <button
+              class="refresh-scripts-btn"
+              :disabled="refreshingScripts"
+              title="重新读取 package.json 中的脚本"
+              @click="handleRefreshScripts"
+            >
+              {{ refreshingScripts ? '刷新中…' : '刷新' }}
+            </button>
+          </div>
           <p class="section-hint">可同时启动多个脚本；日志请在主界面右侧查看</p>
           <div class="script-list">
             <div
@@ -643,6 +673,18 @@ async function handleRemove() {
   min-height: 0;
 }
 
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-head .section-title {
+  margin: 0;
+}
+
 .section-title {
   font-size: 12px;
   font-weight: 700;
@@ -650,6 +692,31 @@ async function handleRemove() {
   letter-spacing: 0.08em;
   margin: 0 0 12px;
   text-transform: uppercase;
+}
+
+.refresh-scripts-btn {
+  flex-shrink: 0;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.08);
+  color: #7dd3fc;
+  font-size: 12px;
+  font-family: inherit;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 600;
+}
+
+.refresh-scripts-btn:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.16);
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+.refresh-scripts-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .section-hint {
