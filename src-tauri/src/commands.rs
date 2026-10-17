@@ -199,15 +199,22 @@ fn pm_program(package_manager: &str) -> &'static str {
   }
 }
 
+/// Hide console windows when spawning helper tools like `taskkill` on Windows.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 fn kill_process_tree(child: &mut Child) {
   let pid = child.id();
 
   #[cfg(windows)]
   {
+    // Without CREATE_NO_WINDOW, each taskkill flashes a black console and steals focus.
     let _ = Command::new("taskkill")
       .args(["/F", "/T", "/PID", &pid.to_string()])
+      .stdin(Stdio::null())
       .stdout(Stdio::null())
       .stderr(Stdio::null())
+      .creation_flags(CREATE_NO_WINDOW)
       .status();
   }
 
@@ -216,12 +223,14 @@ fn kill_process_tree(child: &mut Child) {
     // Negative PID targets the process group created via process_group(0).
     let _ = Command::new("kill")
       .args(["-TERM", &format!("-{}", pid)])
+      .stdin(Stdio::null())
       .stdout(Stdio::null())
       .stderr(Stdio::null())
       .status();
     thread::sleep(Duration::from_millis(200));
     let _ = Command::new("kill")
       .args(["-KILL", &format!("-{}", pid)])
+      .stdin(Stdio::null())
       .stdout(Stdio::null())
       .stderr(Stdio::null())
       .status();
@@ -229,6 +238,34 @@ fn kill_process_tree(child: &mut Child) {
 
   let _ = child.kill();
   let _ = child.wait();
+}
+
+fn kill_and_emit(app_handle: &AppHandle, project_id: String, mut child: Child) {
+  kill_process_tree(&mut child);
+  let _ = app_handle.emit("project:stopped", project_id);
+}
+
+/// Kill multiple process trees in parallel so batch stop does not wait serially.
+fn kill_children_parallel(app_handle: AppHandle, children: Vec<(String, Child)>) {
+  if children.is_empty() {
+    return;
+  }
+  if children.len() == 1 {
+    let (project_id, child) = children.into_iter().next().unwrap();
+    kill_and_emit(&app_handle, project_id, child);
+    return;
+  }
+
+  let mut handles = Vec::with_capacity(children.len());
+  for (project_id, child) in children {
+    let app = app_handle.clone();
+    handles.push(thread::spawn(move || {
+      kill_and_emit(&app, project_id, child);
+    }));
+  }
+  for handle in handles {
+    let _ = handle.join();
+  }
 }
 
 fn default_package_manager() -> String {
@@ -599,7 +636,7 @@ pub fn start_project(
   cmd.stderr(Stdio::piped());
 
   #[cfg(windows)]
-  cmd.creation_flags(0x08000000);
+  cmd.creation_flags(CREATE_NO_WINDOW);
 
   #[cfg(unix)]
   {
@@ -671,7 +708,7 @@ pub fn install_project(
   cmd.stderr(Stdio::piped());
 
   #[cfg(windows)]
-  cmd.creation_flags(0x08000000);
+  cmd.creation_flags(CREATE_NO_WINDOW);
 
   #[cfg(unix)]
   {
@@ -718,13 +755,36 @@ pub fn stop_project(app_handle: AppHandle, path: String, script: String) -> Resu
     processes.remove(&project_id)
   };
 
-  if let Some(mut child) = child {
-    kill_process_tree(&mut child);
-    let _ = app_handle.emit("project:stopped", project_id);
+  if let Some(child) = child {
+    kill_and_emit(&app_handle, project_id, child);
     Ok(true)
   } else {
     Ok(false)
   }
+}
+
+/// Stop every running script that belongs to a project path (parallel kill).
+#[tauri::command]
+pub fn stop_scripts_for_path(app_handle: AppHandle, path: String) -> Result<usize, String> {
+  validate_path_input(&path)?;
+  let prefix = format!("{}@", project_id_from_path(&path));
+
+  let children: Vec<(String, Child)> = {
+    let mut processes = lock_processes();
+    let keys: Vec<String> = processes
+      .keys()
+      .filter(|id| id.starts_with(&prefix))
+      .cloned()
+      .collect();
+    keys
+      .into_iter()
+      .filter_map(|id| processes.remove(&id).map(|child| (id, child)))
+      .collect()
+  };
+
+  let count = children.len();
+  kill_children_parallel(app_handle, children);
+  Ok(count)
 }
 
 #[tauri::command]
@@ -734,12 +794,7 @@ pub fn stop_all_projects(app_handle: AppHandle) -> usize {
     processes.drain().collect()
   };
   let count = children.len();
-
-  for (project_id, mut child) in children {
-    kill_process_tree(&mut child);
-    let _ = app_handle.emit("project:stopped", project_id);
-  }
-
+  kill_children_parallel(app_handle, children);
   count
 }
 

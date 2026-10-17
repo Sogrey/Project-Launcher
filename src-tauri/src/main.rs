@@ -22,6 +22,7 @@ fn main() {
       commands::start_project,
       commands::install_project,
       commands::stop_project,
+      commands::stop_scripts_for_path,
       commands::stop_all_projects,
       commands::load_app_config,
       commands::save_app_config,

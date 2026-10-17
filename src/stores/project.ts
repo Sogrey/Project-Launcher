@@ -501,8 +501,34 @@ export const useProjectStore = defineStore('project', () => {
 
   async function stopAllScriptsForProject(project: Project) {
     const scripts = runningScriptsFor(project.path)
+    if (scripts.length === 0) return
+
     for (const script of scripts) {
-      await stopProject(project, script)
+      const runId = runIdFor(project.path, script)
+      const run = runningRuns.value.get(runId)
+      if (run) {
+        pendingStopEpoch.value.set(runId, run.epoch)
+      }
+    }
+
+    try {
+      // One IPC + parallel process-tree kills on the backend (avoids serial UI stalls).
+      await invoke('stop_scripts_for_path', { path: project.path })
+      for (const script of scripts) {
+        const runId = runIdFor(project.path, script)
+        const current = runningRuns.value.get(runId)
+        const pending = pendingStopEpoch.value.get(runId)
+        if (current && pending !== undefined && current.epoch !== pending) {
+          continue
+        }
+        clearRunRuntime(runId)
+      }
+    } catch (err) {
+      for (const script of scripts) {
+        pendingStopEpoch.value.delete(runIdFor(project.path, script))
+      }
+      toastError(`停止失败: ${errorMessage(err)}`)
+      throw err
     }
   }
 
