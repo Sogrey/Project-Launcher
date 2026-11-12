@@ -135,6 +135,9 @@ Project-Launcher/
    - 进程以 `runId = pathId@script` 为键  
    - 入队检查与 insert 在同一把锁内（避免 TOCTOU）；拒绝入队时先释放锁再 `kill_process_tree`  
    - 同时运行上限：`MAX_RUNNING_PROCESSES`（默认 20）
+   - **仅 build 类限流**：`build` / `compile` / `bundle` / `typecheck` 等默认并发 3，超出自动排队顺延；`dev` / `start` / `serve` / `install` 等不限流
+   - 设置页可改 build 并发（1–8）；启动 build 前若可用内存过低会警告（可继续并加入排队）
+   - 子进程在 Windows 上以 BelowNormal 优先级运行
 2. **前端状态**：`src/stores/project.ts`  
    - `selectProject` → 开/关抽屉  
    - `selectRun` → 右侧日志焦点  
