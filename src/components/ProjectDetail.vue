@@ -153,18 +153,30 @@ async function handleOpenIde() {
   }
 }
 
+function isScriptQueued(script: string) {
+  return store.isScriptQueued(props.project.path, script)
+}
+
 async function handleScriptClick(script: string) {
   try {
+    if (isScriptQueued(script)) {
+      await store.stopProject(props.project, script)
+      return
+    }
     if (isScriptRunning(script)) {
       await store.stopProject(props.project, script)
       toastSuccess(`已停止 ${script}`)
-    } else {
-      const result = await store.startProject(props.project, script)
-      if (!result.success) {
+      return
+    }
+    const result = await store.startProject(props.project, script)
+    if (result.queued) {
+      // store already toasted queue position
+    } else if (!result.success) {
+      if (result.message && result.message !== '已取消') {
         toastError(result.message || '启动失败')
-      } else if (result.project_id) {
-        store.focusRunIfIdle(result.project_id)
       }
+    } else if (result.project_id) {
+      store.focusRunIfIdle(result.project_id)
     }
   } catch (e) {
     toastError(e instanceof Error ? e.message : '操作失败')
@@ -421,14 +433,19 @@ async function handleRemove() {
               {{ refreshingScripts ? '刷新中…' : '刷新' }}
             </button>
           </div>
-          <p class="section-hint">可同时启动多个脚本；日志请在主界面右侧查看</p>
+          <p class="section-hint">
+            可同时启动多个脚本；仅 build 类有并发上限（默认 {{ store.heavyConcurrencyLimit }}，超出排队）。dev/start 等不限。日志在右侧查看
+          </p>
           <div class="script-list">
             <div
               v-for="[name, value] in recommendedScripts"
               :key="name"
               class="script-item"
             >
-              <span class="status-dot" :class="{ running: isScriptRunning(name) }"></span>
+              <span
+                class="status-dot"
+                :class="{ running: isScriptRunning(name), queued: isScriptQueued(name) }"
+              ></span>
               <span class="script-name">{{ name }}</span>
               <span class="script-value">{{ value }}</span>
               <button
@@ -440,10 +457,12 @@ async function handleRemove() {
               </button>
               <button
                 class="script-action-btn"
-                :class="{ running: isScriptRunning(name) }"
+                :class="{ running: isScriptRunning(name), queued: isScriptQueued(name) }"
                 @click="handleScriptClick(name)"
               >
-                {{ isScriptRunning(name) ? '停止' : '启动' }}
+                {{
+                  isScriptRunning(name) ? '停止' : isScriptQueued(name) ? '取消排队' : '启动'
+                }}
               </button>
             </div>
           </div>
@@ -958,6 +977,11 @@ async function handleRemove() {
   box-shadow: 0 0 6px rgba(52, 211, 153, 0.5);
 }
 
+.status-dot.queued {
+  background: #fbbf24;
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.45);
+}
+
 .script-name {
   font-size: 13px;
   font-weight: 600;
@@ -1010,6 +1034,12 @@ async function handleRemove() {
   background: rgba(251, 113, 133, 0.18);
   color: #fb7185;
   border-color: rgba(251, 113, 133, 0.4);
+}
+
+.script-action-btn.queued {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.4);
 }
 
 @media (max-width: 640px) {

@@ -2,16 +2,33 @@
 import { computed, ref, watch } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { open as openUrl } from '@tauri-apps/plugin-shell'
-import { useProjectStore, type Project } from '@/stores/project'
+import {
+  useProjectStore,
+  type Project,
+  MIN_HEAVY_CONCURRENCY,
+  MAX_HEAVY_CONCURRENCY,
+} from '@/stores/project'
 import ProjectDetail from './ProjectDetail.vue'
 import LogPanel from './LogPanel.vue'
 import { toastSuccess, toastError } from '@/utils/toast'
 
 const store = useProjectStore()
 const showWorkspacePanel = ref(false)
+const showSettingsPanel = ref(false)
+const settingsConcurrency = ref(store.heavyConcurrencyLimit)
 const newWorkspaceName = ref('')
 const renamingId = ref<string | null>(null)
 const renameValue = ref('')
+
+watch(showSettingsPanel, (open) => {
+  if (open) settingsConcurrency.value = store.heavyConcurrencyLimit
+})
+
+async function handleSaveSettings() {
+  await store.setHeavyConcurrencyLimit(settingsConcurrency.value)
+  toastSuccess(`build 并发已设为 ${store.heavyConcurrencyLimit}`)
+  showSettingsPanel.value = false
+}
 
 const focusedMeta = computed(() => {
   const id = store.selectedRunId
@@ -314,8 +331,13 @@ function handleClearError(runId: string) {
             <span class="stat-value">{{ store.todayStartCount }}</span>
             <span class="stat-label">今日启动</span>
           </div>
+          <div v-if="store.heavyQueueCount > 0" class="stat-item queued">
+            <span class="stat-value">{{ store.heavyQueueCount }}</span>
+            <span class="stat-label">build 排队</span>
+          </div>
         </div>
         <div class="actions">
+          <button class="btn btn-outline" @click="showSettingsPanel = true">设置</button>
           <button class="btn btn-outline" @click="showWorkspacePanel = true">工作区</button>
           <button class="btn btn-secondary" @click="handleAddProject">新增项目</button>
           <button class="btn btn-danger" @click="handleStopAll">一键全停</button>
@@ -442,7 +464,29 @@ function handleClearError(runId: string) {
             </div>
           </div>
 
-          <div v-if="store.runningRunList.length === 0" class="empty-column">
+          <div
+            v-for="(item, qIndex) in store.heavyQueue"
+            :key="`q-${item.project.path}-${item.script}-${item.enqueuedAt}`"
+            class="tile project-tile queued"
+          >
+            <div class="tile-header">
+              <span class="status-dot queued"></span>
+              <h3 class="project-name">{{ item.project.name }}</h3>
+              <button
+                class="tile-stop"
+                title="取消排队"
+                @click.stop="store.cancelQueued(item.project.path, item.script)"
+              >
+                ×
+              </button>
+            </div>
+            <p class="project-path">{{ item.project.path }}</p>
+            <div class="running-info">
+              <span class="current-script">排队 #{{ qIndex + 1 }} · {{ item.script }}</span>
+            </div>
+          </div>
+
+          <div v-if="store.runningRunList.length === 0 && store.heavyQueueCount === 0" class="empty-column">
             <p>暂无运行中的脚本</p>
             <p class="hint">点击左侧项目启动脚本后会出现在这里</p>
           </div>
@@ -527,6 +571,40 @@ function handleClearError(runId: string) {
       :project="store.selectedProject"
       @close="handleCloseDetail"
     />
+
+    <div
+      v-if="showSettingsPanel"
+      class="ws-overlay"
+      @click.self="showSettingsPanel = false"
+    >
+      <div class="ws-panel settings-panel">
+        <div class="ws-header">
+          <h2>设置</h2>
+          <button class="close-btn" @click="showSettingsPanel = false">×</button>
+        </div>
+        <p class="ws-hint">
+          仅限制 build / compile 等打包类任务并发；dev、start、serve、install 等不限流，超出部分自动排队顺延。
+        </p>
+        <label class="settings-field">
+          <span class="settings-label">build 并发数（默认 3）</span>
+          <input
+            v-model.number="settingsConcurrency"
+            class="ws-input"
+            type="number"
+            :min="MIN_HEAVY_CONCURRENCY"
+            :max="MAX_HEAVY_CONCURRENCY"
+          />
+        </label>
+        <p class="ws-hint">
+          允许范围 {{ MIN_HEAVY_CONCURRENCY }}–{{ MAX_HEAVY_CONCURRENCY }}；当前运行中 build
+          {{ store.heavyRunningCount }}，排队 {{ store.heavyQueueCount }}
+        </p>
+        <div class="settings-actions">
+          <button class="btn btn-secondary" @click="handleSaveSettings">保存</button>
+          <button class="btn btn-outline" @click="showSettingsPanel = false">取消</button>
+        </div>
+      </div>
+    </div>
 
     <div
       v-if="showWorkspacePanel"
@@ -728,6 +806,11 @@ function handleClearError(runId: string) {
 .stat-item.errored .stat-value {
   color: var(--accent-rose);
   text-shadow: 0 0 12px rgba(251, 113, 133, 0.4);
+}
+
+.stat-item.queued .stat-value {
+  color: #fbbf24;
+  text-shadow: 0 0 12px rgba(251, 191, 36, 0.4);
 }
 
 .stat-label {
@@ -1157,8 +1240,17 @@ function handleClearError(runId: string) {
   animation: pulse 2s infinite;
 }
 
+.status-dot.queued {
+  background: #fbbf24;
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.55);
+}
+
 .status-dot.stopped {
   background: #64748b;
+}
+
+.project-tile.queued {
+  border-color: rgba(251, 191, 36, 0.35);
 }
 
 @keyframes pulse {
@@ -1334,6 +1426,24 @@ function handleClearError(runId: string) {
   font-size: 12px;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+.settings-panel .settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-label {
+  font-size: 12px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.settings-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
 }
 
 .ws-create,

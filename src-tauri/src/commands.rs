@@ -28,7 +28,159 @@ lazy_static::lazy_static! {
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const LOG_FLUSH_LINES: usize = 50;
 const MAX_PATH_LEN: usize = 4096;
+/// Soft cap for all tracked scripts (dev + build + install, …).
 const MAX_RUNNING_PROCESSES: usize = 20;
+
+/// Hide console windows when spawning helper tools / child processes on Windows.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Keep the desktop responsive while many npm/pnpm jobs run.
+#[cfg(windows)]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+
+fn script_from_run_id(run_id: &str) -> &str {
+  run_id.rsplit_once('@').map(|(_, script)| script).unwrap_or(run_id)
+}
+
+fn admission_error(processes: &HashMap<String, Child>, project_id: &str, _script: &str) -> Option<String> {
+  // Heavy build concurrency is enforced on the frontend via a queue.
+  // Backend only guards duplicates + a hard safety cap.
+  if processes.contains_key(project_id) {
+    Some("该脚本已在运行中".to_string())
+  } else if processes.len() >= MAX_RUNNING_PROCESSES {
+    Some(format!(
+      "同时运行进程数不能超过 {}",
+      MAX_RUNNING_PROCESSES
+    ))
+  } else {
+    None
+  }
+}
+
+const DEFAULT_HEAVY_CONCURRENCY: u32 = 3;
+const MIN_HEAVY_CONCURRENCY: u32 = 1;
+const MAX_HEAVY_CONCURRENCY: u32 = 8;
+
+fn default_heavy_concurrency_limit() -> u32 {
+  DEFAULT_HEAVY_CONCURRENCY
+}
+
+fn clamp_heavy_concurrency(n: u32) -> u32 {
+  n.clamp(MIN_HEAVY_CONCURRENCY, MAX_HEAVY_CONCURRENCY)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStatus {
+  pub total_bytes: u64,
+  pub available_bytes: u64,
+  /// 0–100 from OS (Windows) or derived elsewhere.
+  pub memory_load_percent: u32,
+}
+
+#[tauri::command]
+pub fn get_memory_status() -> Result<MemoryStatus, String> {
+  #[cfg(windows)]
+  {
+    #[repr(C)]
+    struct MemoryStatusEx {
+      length: u32,
+      memory_load: u32,
+      total_phys: u64,
+      avail_phys: u64,
+      total_page_file: u64,
+      avail_page_file: u64,
+      total_virtual: u64,
+      avail_virtual: u64,
+      avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+      fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+      length: std::mem::size_of::<MemoryStatusEx>() as u32,
+      memory_load: 0,
+      total_phys: 0,
+      avail_phys: 0,
+      total_page_file: 0,
+      avail_page_file: 0,
+      total_virtual: 0,
+      avail_virtual: 0,
+      avail_extended_virtual: 0,
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 {
+      return Err("无法读取内存状态".to_string());
+    }
+    return Ok(MemoryStatus {
+      total_bytes: status.total_phys,
+      available_bytes: status.avail_phys,
+      memory_load_percent: status.memory_load,
+    });
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    let content =
+      std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("读取 meminfo 失败: {e}"))?;
+    let mut total_kb = 0u64;
+    let mut available_kb = 0u64;
+    for line in content.lines() {
+      if let Some(rest) = line.strip_prefix("MemTotal:") {
+        total_kb = rest
+          .split_whitespace()
+          .next()
+          .and_then(|s| s.parse().ok())
+          .unwrap_or(0);
+      } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+        available_kb = rest
+          .split_whitespace()
+          .next()
+          .and_then(|s| s.parse().ok())
+          .unwrap_or(0);
+      }
+    }
+    if total_kb == 0 {
+      return Err("无法解析 MemTotal".to_string());
+    }
+    let used = total_kb.saturating_sub(available_kb);
+    let load = ((used as f64 / total_kb as f64) * 100.0).round() as u32;
+    return Ok(MemoryStatus {
+      total_bytes: total_kb * 1024,
+      available_bytes: available_kb * 1024,
+      memory_load_percent: load.min(100),
+    });
+  }
+
+  #[cfg(not(any(windows, target_os = "linux")))]
+  {
+    Err("当前平台暂不支持内存检测".to_string())
+  }
+}
+
+/// Fast-fail before spawn so a rejected build never starts allocating memory.
+fn precheck_can_start(project_id: &str, script: &str) -> Result<(), String> {
+  let processes = lock_processes();
+  if let Some(message) = admission_error(&processes, project_id, script) {
+    Err(message)
+  } else {
+    Ok(())
+  }
+}
+
+fn spawn_creation_flags() -> u32 {
+  #[cfg(windows)]
+  {
+    CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+  }
+  #[cfg(not(windows))]
+  {
+    0
+  }
+}
 
 fn lock_processes() -> MutexGuard<'static, HashMap<String, Child>> {
   RUNNING_PROCESSES
@@ -198,10 +350,6 @@ fn pm_program(package_manager: &str) -> &'static str {
     }
   }
 }
-
-/// Hide console windows when spawning helper tools like `taskkill` on Windows.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn kill_process_tree(child: &mut Child) {
   let pid = child.id();
@@ -502,13 +650,9 @@ fn begin_tracked_process(
   let mut orphan: Option<Child> = Some(child);
   let rejected: Option<String> = {
     let mut processes = lock_processes();
-    if processes.contains_key(&project_id) {
-      Some("该脚本已在运行中".to_string())
-    } else if processes.len() >= MAX_RUNNING_PROCESSES {
-      Some(format!(
-        "同时运行进程数不能超过 {}",
-        MAX_RUNNING_PROCESSES
-      ))
+    let script = script_from_run_id(&project_id);
+    if let Some(message) = admission_error(&processes, &project_id, script) {
+      Some(message)
     } else if let Some(admitted) = orphan.take() {
       processes.insert(project_id.clone(), admitted);
       None
@@ -618,6 +762,14 @@ pub fn start_project(
     };
   }
 
+  if let Err(message) = precheck_can_start(&project_id, &script) {
+    return StartResult {
+      success: false,
+      message,
+      project_id,
+    };
+  }
+
   let program = pm_program(&package_manager);
   let mut cmd = Command::new(program);
   match package_manager.as_str() {
@@ -636,7 +788,7 @@ pub fn start_project(
   cmd.stderr(Stdio::piped());
 
   #[cfg(windows)]
-  cmd.creation_flags(CREATE_NO_WINDOW);
+  cmd.creation_flags(spawn_creation_flags());
 
   #[cfg(unix)]
   {
@@ -697,6 +849,14 @@ pub fn install_project(
     };
   }
 
+  if let Err(message) = precheck_can_start(&project_id, &script) {
+    return StartResult {
+      success: false,
+      message,
+      project_id,
+    };
+  }
+
   let program = pm_program(&package_manager);
   let mut cmd = Command::new(program);
   cmd.arg("install");
@@ -708,7 +868,7 @@ pub fn install_project(
   cmd.stderr(Stdio::piped());
 
   #[cfg(windows)]
-  cmd.creation_flags(CREATE_NO_WINDOW);
+  cmd.creation_flags(spawn_creation_flags());
 
   #[cfg(unix)]
   {
@@ -815,6 +975,9 @@ pub struct Workspace {
 pub struct AppConfig {
   pub active_workspace_id: String,
   pub workspaces: Vec<Workspace>,
+  /// Max concurrent build/install-class jobs; extras wait in a frontend queue.
+  #[serde(default = "default_heavy_concurrency_limit")]
+  pub heavy_concurrency_limit: u32,
 }
 
 fn new_workspace_id() -> String {
@@ -836,6 +999,7 @@ fn default_app_config() -> AppConfig {
       name: "默认".to_string(),
       projects: Vec::new(),
     }],
+    heavy_concurrency_limit: DEFAULT_HEAVY_CONCURRENCY,
   }
 }
 
@@ -878,7 +1042,7 @@ pub fn load_app_config(app_handle: AppHandle) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-pub fn save_app_config(app_handle: AppHandle, config: AppConfig) -> Result<bool, String> {
+pub fn save_app_config(app_handle: AppHandle, mut config: AppConfig) -> Result<bool, String> {
   if config.workspaces.is_empty() {
     return Err("至少需要一个工作区".to_string());
   }
@@ -889,6 +1053,8 @@ pub fn save_app_config(app_handle: AppHandle, config: AppConfig) -> Result<bool,
   {
     return Err("activeWorkspaceId 不存在".to_string());
   }
+
+  config.heavy_concurrency_limit = clamp_heavy_concurrency(config.heavy_concurrency_limit);
 
   let store = open_config_store(&app_handle).ok_or_else(|| "无法打开配置存储".to_string())?;
   store.set("app_config".to_string(), json!(config));

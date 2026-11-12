@@ -27,6 +27,7 @@ fn main() {
       commands::load_app_config,
       commands::save_app_config,
       commands::create_workspace_id,
+      commands::get_memory_status,
       ide::list_installed_ides,
       ide::open_in_explorer,
       ide::open_in_ide,

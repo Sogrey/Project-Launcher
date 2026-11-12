@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { toastError, toastWarning } from '@/utils/toast'
+import { toastError, toastSuccess, toastWarning } from '@/utils/toast'
 
 export interface Project {
   name: string
@@ -20,6 +20,49 @@ export interface Workspace {
 export interface AppConfig {
   activeWorkspaceId: string
   workspaces: Workspace[]
+  /** Max concurrent *build* jobs; extras wait in heavyQueue. Default 3. */
+  heavyConcurrencyLimit?: number
+}
+
+export interface QueuedRun {
+  project: Project
+  script: string
+  packageManager: PackageManager
+  enqueuedAt: number
+}
+
+export interface MemoryStatus {
+  totalBytes: number
+  availableBytes: number
+  memoryLoadPercent: number
+}
+
+/** Default / clamp for packaging-task concurrency (keep in sync with Rust). */
+export const DEFAULT_HEAVY_CONCURRENCY = 3
+export const MIN_HEAVY_CONCURRENCY = 1
+export const MAX_HEAVY_CONCURRENCY = 8
+
+/** Warn when free RAM is below this (bytes) or load is very high. */
+const MEMORY_WARN_AVAILABLE_BYTES = 2 * 1024 * 1024 * 1024
+const MEMORY_WARN_LOAD_PERCENT = 85
+
+/**
+ * Only *build* / compile packaging scripts are concurrency-limited + queued.
+ * Non-build (`dev` / `start` / `serve` / `install` / …) are unlimited.
+ */
+export function isHeavyScript(script: string): boolean {
+  const s = script.trim().toLowerCase()
+  if (!s) return false
+  if (s === 'build' || s === 'compile' || s === 'bundle' || s === 'typecheck' || s === 'tsc') {
+    return true
+  }
+  // e.g. build-dev, build:prod, vue-build — but not "rebuild-cache" false positives from "build" substring OK for packaging
+  return s.includes('build') || s.includes('compile') || s.includes('bundle') || s.includes('typecheck')
+}
+
+export function clampHeavyConcurrency(n: number): number {
+  if (!Number.isFinite(n)) return DEFAULT_HEAVY_CONCURRENCY
+  return Math.min(MAX_HEAVY_CONCURRENCY, Math.max(MIN_HEAVY_CONCURRENCY, Math.round(n)))
 }
 
 export interface InstalledIde {
@@ -100,7 +143,14 @@ function defaultConfig(): AppConfig {
   return {
     activeWorkspaceId: 'ws_default',
     workspaces: [{ id: 'ws_default', name: '默认', projects: [] }],
+    heavyConcurrencyLimit: DEFAULT_HEAVY_CONCURRENCY,
   }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`
+  return `${bytes} B`
 }
 
 export const useProjectStore = defineStore('project', () => {
@@ -129,6 +179,10 @@ export const useProjectStore = defineStore('project', () => {
   const idesReady = ref(false)
   const idesLoading = ref(false)
   let idesLoadPromise: Promise<void> | null = null
+  /** Packaging tasks waiting for a free concurrency slot. */
+  const heavyQueue = ref<QueuedRun[]>([])
+  const heavyConcurrencyLimit = ref(DEFAULT_HEAVY_CONCURRENCY)
+  let drainingHeavyQueue = false
 
   const activeWorkspace = computed(
     () => workspaces.value.find((w) => w.id === activeWorkspaceId.value) || null
@@ -136,6 +190,12 @@ export const useProjectStore = defineStore('project', () => {
   const activeWorkspaceName = computed(() => activeWorkspace.value?.name || '未命名')
 
   const totalProjects = computed(() => projects.value.length)
+
+  const heavyRunningCount = computed(
+    () => [...runningRuns.value.values()].filter((r) => isHeavyScript(r.script)).length
+  )
+
+  const heavyQueueCount = computed(() => heavyQueue.value.length)
 
   const runningRunList = computed(() =>
     [...runningRuns.value.values()].filter((run) =>
@@ -263,6 +323,7 @@ export const useProjectStore = defineStore('project', () => {
         ...w,
         projects: [...w.projects],
       })),
+      heavyConcurrencyLimit: clampHeavyConcurrency(heavyConcurrencyLimit.value),
     }
     try {
       await invoke('save_app_config', { config })
@@ -279,6 +340,9 @@ export const useProjectStore = defineStore('project', () => {
       const normalized = config?.workspaces?.length > 0 ? config : defaultConfig()
 
       workspaces.value = normalized.workspaces
+      heavyConcurrencyLimit.value = clampHeavyConcurrency(
+        normalized.heavyConcurrencyLimit ?? DEFAULT_HEAVY_CONCURRENCY
+      )
       const removed = sanitizeAllWorkspaces()
       activeWorkspaceId.value = normalized.workspaces.some(
         (w) => w.id === normalized.activeWorkspaceId
@@ -298,10 +362,201 @@ export const useProjectStore = defineStore('project', () => {
       const fallback = defaultConfig()
       workspaces.value = fallback.workspaces
       activeWorkspaceId.value = fallback.activeWorkspaceId
+      heavyConcurrencyLimit.value = DEFAULT_HEAVY_CONCURRENCY
       syncActiveProjectsFromWorkspaces()
       toastError(`加载配置失败: ${errorMessage(err)}`)
       initialized.value = true
     }
+  }
+
+  async function setHeavyConcurrencyLimit(n: number) {
+    heavyConcurrencyLimit.value = clampHeavyConcurrency(n)
+    await persistConfig()
+    void drainHeavyQueue()
+  }
+
+  function isScriptQueued(path: string, script: string): boolean {
+    return heavyQueue.value.some((q) => q.project.path === path && q.script === script)
+  }
+
+  function queuePosition(path: string, script: string): number {
+    return heavyQueue.value.findIndex((q) => q.project.path === path && q.script === script)
+  }
+
+  function enqueueHeavy(project: Project, script: string): boolean {
+    if (isScriptQueued(project.path, script) || isScriptRunning(project.path, script)) {
+      return false
+    }
+    heavyQueue.value = [
+      ...heavyQueue.value,
+      {
+        project,
+        script,
+        packageManager: packageManagerFor(project),
+        enqueuedAt: Date.now(),
+      },
+    ]
+    return true
+  }
+
+  function cancelQueued(path: string, script: string) {
+    heavyQueue.value = heavyQueue.value.filter(
+      (q) => !(q.project.path === path && q.script === script)
+    )
+  }
+
+  function cancelQueuedForProject(path: string) {
+    heavyQueue.value = heavyQueue.value.filter((q) => q.project.path !== path)
+  }
+
+  function clearHeavyQueue() {
+    heavyQueue.value = []
+  }
+
+  /**
+   * Non-blocking memory check. Returns false if user cancels the warning.
+   * On check failure, allow continue (don't block startups).
+   */
+  async function confirmMemoryIfLow(): Promise<boolean> {
+    try {
+      const mem = await invoke<MemoryStatus>('get_memory_status')
+      const low =
+        mem.availableBytes < MEMORY_WARN_AVAILABLE_BYTES ||
+        mem.memoryLoadPercent >= MEMORY_WARN_LOAD_PERCENT
+      if (!low) return true
+      return window.confirm(
+        `当前可用内存较低（剩余 ${formatBytes(mem.availableBytes)}，占用 ${mem.memoryLoadPercent}%）。\n` +
+          `继续可能加剧卡顿；确定仍要启动/加入排队吗？`
+      )
+    } catch {
+      return true
+    }
+  }
+
+  async function launchTracked(
+    project: Project,
+    script: string,
+    kind: 'script' | 'install'
+  ): Promise<{ success: boolean; message: string; project_id: string }> {
+    const pm = packageManagerFor(project)
+    const runId = runIdFor(project.path, script)
+    try {
+      const result =
+        kind === 'install'
+          ? await invoke<{ success: boolean; message: string; project_id: string }>(
+              'install_project',
+              { path: project.path, packageManager: pm }
+            )
+          : await invoke<{ success: boolean; message: string; project_id: string }>(
+              'start_project',
+              { path: project.path, script, packageManager: pm }
+            )
+
+      if (result.success) {
+        erroredRuns.value.delete(runId)
+        const id = result.project_id || runId
+        const epoch = nextEpoch(id)
+        runningRuns.value.set(id, {
+          runId: id,
+          project,
+          script,
+          packageManager: pm,
+          epoch,
+        })
+        runLogs.value.set(id, [])
+        if (kind === 'script') {
+          todayStartCount.value += 1
+        }
+      }
+
+      return result
+    } catch (err) {
+      const message = errorMessage(err)
+      toastError(kind === 'install' ? `安装失败: ${message}` : `启动失败: ${message}`)
+      return { success: false, message, project_id: '' }
+    }
+  }
+
+  async function drainHeavyQueue() {
+    if (drainingHeavyQueue) return
+    drainingHeavyQueue = true
+    try {
+      while (heavyRunningCount.value < heavyConcurrencyLimit.value) {
+        const next = heavyQueue.value[0]
+        if (!next) break
+        heavyQueue.value = heavyQueue.value.slice(1)
+
+        // Project may have been removed while queued.
+        if (!projects.value.some((p) => p.path === next.project.path)) {
+          continue
+        }
+        if (isScriptRunning(next.project.path, next.script)) {
+          continue
+        }
+
+        // Queue only holds build-class scripts (install is never heavy).
+        const result = await launchTracked(next.project, next.script, 'script')
+        if (result.success) {
+          toastSuccess(`排队任务已启动：${next.project.name} / ${next.script}`)
+          if (result.project_id) focusRunIfIdle(result.project_id)
+        } else if (result.message) {
+          toastError(`排队任务启动失败（${next.project.name} / ${next.script}）：${result.message}`)
+        }
+      }
+    } finally {
+      drainingHeavyQueue = false
+    }
+  }
+
+  /**
+   * Start a script, or enqueue packaging tasks when at concurrency limit.
+   * @param options.skipMemoryCheck used when draining the queue
+   * @param options.forceQueue put into queue even if a slot is free (unused currently)
+   */
+  async function requestStart(
+    project: Project,
+    script: string,
+    options?: { skipMemoryCheck?: boolean; kind?: 'script' | 'install' }
+  ): Promise<{ success: boolean; message: string; project_id: string; queued?: boolean }> {
+    const kind = options?.kind ?? (script === 'install' ? 'install' : 'script')
+    if (kind === 'script' && !isListedScriptName(script)) {
+      toastWarning('非法脚本名（注释/元数据类脚本不可运行）')
+      return { success: false, message: '非法脚本名', project_id: '' }
+    }
+
+    if (isScriptRunning(project.path, script)) {
+      toastWarning('该脚本已在运行中')
+      return { success: false, message: '该脚本已在运行中', project_id: '' }
+    }
+
+    // Memory warning only for build-class tasks; non-build starts stay frictionless.
+    if (isHeavyScript(script) && !options?.skipMemoryCheck) {
+      const ok = await confirmMemoryIfLow()
+      if (!ok) {
+        return { success: false, message: '已取消', project_id: '' }
+      }
+    }
+
+    if (isHeavyScript(script)) {
+      if (isScriptQueued(project.path, script)) {
+        toastWarning('该 build 任务已在排队中')
+        return { success: false, message: '已在排队中', project_id: '', queued: true }
+      }
+      if (heavyRunningCount.value >= heavyConcurrencyLimit.value) {
+        enqueueHeavy(project, script)
+        const pos = queuePosition(project.path, script) + 1
+        toastSuccess(
+          `build 并发已满（${heavyConcurrencyLimit.value}），已加入排队（第 ${pos} 位）：${project.name} / ${script}`
+        )
+        return { success: true, message: '已加入排队', project_id: '', queued: true }
+      }
+    }
+
+    const result = await launchTracked(project, script, kind)
+    if (result.success) {
+      void drainHeavyQueue()
+    }
+    return result
   }
 
   /** Scan installed IDEs once; subsequent calls reuse the cached list. */
@@ -377,6 +632,8 @@ export const useProjectStore = defineStore('project', () => {
 
     if (runningRuns.value.size > 0) {
       await stopAllProjects()
+    } else {
+      clearHeavyQueue()
     }
 
     writeProjectsToActiveWorkspace()
@@ -401,6 +658,8 @@ export const useProjectStore = defineStore('project', () => {
 
     if (runningRuns.value.size > 0) {
       await stopAllProjects()
+    } else {
+      clearHeavyQueue()
     }
 
     writeProjectsToActiveWorkspace()
@@ -442,6 +701,8 @@ export const useProjectStore = defineStore('project', () => {
 
     if (id === activeWorkspaceId.value && runningRuns.value.size > 0) {
       await stopAllProjects()
+    } else if (id === activeWorkspaceId.value) {
+      clearHeavyQueue()
     }
 
     writeProjectsToActiveWorkspace()
@@ -457,6 +718,7 @@ export const useProjectStore = defineStore('project', () => {
       runPorts.value.clear()
       runEpochs.value.clear()
       pendingStopEpoch.value.clear()
+      clearHeavyQueue()
     }
 
     await persistConfig()
@@ -500,8 +762,12 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function stopAllScriptsForProject(project: Project) {
+    cancelQueuedForProject(project.path)
     const scripts = runningScriptsFor(project.path)
-    if (scripts.length === 0) return
+    if (scripts.length === 0) {
+      void drainHeavyQueue()
+      return
+    }
 
     for (const script of scripts) {
       const runId = runIdFor(project.path, script)
@@ -523,6 +789,7 @@ export const useProjectStore = defineStore('project', () => {
         }
         clearRunRuntime(runId)
       }
+      void drainHeavyQueue()
     } catch (err) {
       for (const script of scripts) {
         pendingStopEpoch.value.delete(runIdFor(project.path, script))
@@ -534,6 +801,7 @@ export const useProjectStore = defineStore('project', () => {
 
   async function removeProject(project: Project) {
     try {
+      cancelQueuedForProject(project.path)
       await stopAllScriptsForProject(project)
       projects.value = projects.value.filter((p) => p.path !== project.path)
       for (const [runId, run] of [...runningRuns.value.entries()]) {
@@ -621,71 +889,21 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   async function startProject(project: Project, script: string) {
-    if (!isListedScriptName(script)) {
-      toastWarning('非法脚本名（注释/元数据类脚本不可运行）')
-      return { success: false, message: '非法脚本名', project_id: '' }
-    }
-    const pm = packageManagerFor(project)
-    const runId = runIdFor(project.path, script)
-    try {
-      const result = await invoke<{ success: boolean; message: string; project_id: string }>(
-        'start_project',
-        { path: project.path, script, packageManager: pm }
-      )
-
-      if (result.success) {
-        erroredRuns.value.delete(runId)
-        const id = result.project_id || runId
-        const epoch = nextEpoch(id)
-        runningRuns.value.set(id, {
-          runId: id,
-          project,
-          script,
-          packageManager: pm,
-          epoch,
-        })
-        runLogs.value.set(id, [])
-        todayStartCount.value += 1
-      }
-
-      return result
-    } catch (err) {
-      toastError(`启动失败: ${errorMessage(err)}`)
-      return { success: false, message: errorMessage(err), project_id: '' }
-    }
+    return requestStart(project, script, { kind: 'script' })
   }
 
   async function installProject(project: Project) {
-    const pm = packageManagerFor(project)
-    const runId = runIdFor(project.path, 'install')
-    try {
-      const result = await invoke<{ success: boolean; message: string; project_id: string }>(
-        'install_project',
-        { path: project.path, packageManager: pm }
-      )
-
-      if (result.success) {
-        erroredRuns.value.delete(runId)
-        const id = result.project_id || runId
-        const epoch = nextEpoch(id)
-        runningRuns.value.set(id, {
-          runId: id,
-          project,
-          script: 'install',
-          packageManager: pm,
-          epoch,
-        })
-        runLogs.value.set(id, [])
-      }
-
-      return result
-    } catch (err) {
-      toastError(`安装失败: ${errorMessage(err)}`)
-      return { success: false, message: errorMessage(err), project_id: '' }
-    }
+    return requestStart(project, 'install', { kind: 'install' })
   }
 
   async function stopProject(project: Project, script: string) {
+    // Cancel queue entry if not running yet.
+    if (isScriptQueued(project.path, script) && !isScriptRunning(project.path, script)) {
+      cancelQueued(project.path, script)
+      toastSuccess(`已取消排队：${script}`)
+      return
+    }
+
     const runId = runIdFor(project.path, script)
     const run = runningRuns.value.get(runId)
     if (run) {
@@ -701,6 +919,7 @@ export const useProjectStore = defineStore('project', () => {
         return
       }
       clearRunRuntime(runId)
+      void drainHeavyQueue()
     } catch (err) {
       // Keep frontend running state so user can retry stop (#6).
       pendingStopEpoch.value.delete(runId)
@@ -714,13 +933,36 @@ export const useProjectStore = defineStore('project', () => {
       toastWarning('安装完成后请手动启动脚本')
       return { success: false, message: '无法重启', project_id: '' }
     }
+    // Drop any queued duplicate so restart does not fight the queue.
+    cancelQueued(project.path, script)
+
     if (isScriptRunning(project.path, script)) {
-      await stopProject(project, script)
+      // Stop without draining first — otherwise a queued build can steal the slot
+      // before this restart relaunches.
+      const runId = runIdFor(project.path, script)
+      const run = runningRuns.value.get(runId)
+      if (run) pendingStopEpoch.value.set(runId, run.epoch)
+      try {
+        await invoke('stop_project', { path: project.path, script })
+        const current = runningRuns.value.get(runId)
+        const pending = pendingStopEpoch.value.get(runId)
+        if (!(current && pending !== undefined && current.epoch !== pending)) {
+          clearRunRuntime(runId)
+        }
+      } catch (err) {
+        pendingStopEpoch.value.delete(runId)
+        toastError(`停止失败: ${errorMessage(err)}`)
+        throw err
+      }
     }
-    return startProject(project, script)
+
+    const result = await requestStart(project, script, { kind: 'script' })
+    void drainHeavyQueue()
+    return result
   }
 
   async function stopAllProjects() {
+    clearHeavyQueue()
     try {
       await invoke('stop_all_projects')
       runningRuns.value.clear()
@@ -751,7 +993,9 @@ export const useProjectStore = defineStore('project', () => {
     if (run && pending === undefined) {
       // stop_all / external: clear only if no newer start race — treat as clear.
     }
+    const wasHeavy = run ? isHeavyScript(run.script) : isHeavyScript(scriptFromRunId(runId))
     clearRunRuntime(runId)
+    if (wasHeavy) void drainHeavyQueue()
   }
 
   function markExited(runId: string, success: boolean) {
@@ -763,6 +1007,9 @@ export const useProjectStore = defineStore('project', () => {
     }
 
     const exitedRun = run
+    const wasHeavy = exitedRun
+      ? isHeavyScript(exitedRun.script)
+      : isHeavyScript(scriptFromRunId(runId))
     if (!success && exitedRun) {
       // Keep logs so the 异常 panel can reopen them in the log pane.
       clearRunRuntime(runId, { keepLogs: true })
@@ -775,6 +1022,12 @@ export const useProjectStore = defineStore('project', () => {
       clearRunRuntime(runId)
       erroredRuns.value.delete(runId)
     }
+    if (wasHeavy) void drainHeavyQueue()
+  }
+
+  function scriptFromRunId(runId: string): string {
+    const at = runId.lastIndexOf('@')
+    return at >= 0 ? runId.slice(at + 1) : runId
   }
 
   function addPort(runId: string, port: string) {
@@ -853,6 +1106,15 @@ export const useProjectStore = defineStore('project', () => {
     erroredCount,
     runningRunList,
     erroredRunList,
+    heavyQueue,
+    heavyQueueCount,
+    heavyRunningCount,
+    heavyConcurrencyLimit,
+    setHeavyConcurrencyLimit,
+    isScriptQueued,
+    queuePosition,
+    cancelQueued,
+    clearHeavyQueue,
     installedIdes,
     idesReady,
     idesLoading,
